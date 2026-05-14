@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Mecanum stick curve visualizer</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    background: #111;
+    color: #ddd;
+    margin: 0;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 480px 1fr;
+    gap: 24px;
+    max-width: 1200px;
+  }
+  h1 { font-size: 16px; margin: 0 0 12px 0; color: #fff; }
+  canvas {
+    background: #000;
+    border: 1px solid #333;
+    display: block;
+  }
+  .panel { background: #1a1a1a; padding: 16px; border: 1px solid #2a2a2a; }
+  .row { display: grid; grid-template-columns: 130px 1fr 60px; align-items: center; gap: 8px; margin: 8px 0; }
+  .row label { color: #aaa; font-size: 12px; }
+  .row input[type=range] { width: 100%; }
+  .row .val { text-align: right; font-variant-numeric: tabular-nums; color: #fff; }
+  select { background: #222; color: #ddd; border: 1px solid #444; padding: 4px 6px; font-family: inherit; }
+  button {
+    background: #2a5a2a; color: #fff; border: 1px solid #3a7a3a;
+    padding: 8px 14px; font-family: inherit; cursor: pointer; margin-top: 8px;
+  }
+  button:hover { background: #357a35; }
+  button.secondary { background: #333; border-color: #555; }
+  button.secondary:hover { background: #444; }
+  pre {
+    background: #000; color: #6f6;
+    padding: 12px; border: 1px solid #333;
+    overflow: auto; font-size: 12px; margin-top: 12px;
+  }
+  .legend { font-size: 11px; color: #888; margin-top: 6px; }
+  .legend b { color: #ddd; }
+</style>
+</head>
+<body>
+
+<div>
+  <h1>Stick &rarr; PWM curve</h1>
+  <canvas id="plot" width="460" height="460"></canvas>
+  <div class="legend">
+    X = stick deflection (0..1). Y = output (0..1).<br/>
+    <b>Bright white</b> = curve × runtime speed%. <b>Dim white</b> = curve at runtime=100%.<br/>
+    <b>Gray dashed</b> = linear ref. <b>Yellow dot</b> = mid-stick (0.5).
+  </div>
+</div>
+
+<div class="panel">
+  <h1>Parameters</h1>
+
+  <div class="row">
+    <label>Curve shape</label>
+    <select id="kind">
+      <option value="linear">Linear</option>
+      <option value="smoothstep">Smoothstep (cubic S)</option>
+      <option value="smootherstep" selected>Smootherstep (quintic S)</option>
+      <option value="logistic">Logistic (sigmoid)</option>
+      <option value="power">Power (exp)</option>
+    </select>
+    <span></span>
+  </div>
+
+  <div class="row">
+    <label>Curve max %</label>
+    <input type="range" id="maxPct" min="10" max="100" step="5" value="100" />
+    <span class="val" id="maxPctV">100</span>
+  </div>
+
+  <div class="row">
+    <label>Runtime speed %</label>
+    <input type="range" id="runPct" min="10" max="100" step="5" value="50" />
+    <span class="val" id="runPctV">50</span>
+  </div>
+
+  <div class="row">
+    <label>Deadzone (stick %)</label>
+    <input type="range" id="dead" min="0" max="30" step="1" value="8" />
+    <span class="val" id="deadV">8</span>
+  </div>
+
+  <div class="row" id="rowK">
+    <label>Steepness k</label>
+    <input type="range" id="k" min="1" max="20" step="0.5" value="8" />
+    <span class="val" id="kV">8</span>
+  </div>
+
+  <div class="row" id="rowMid">
+    <label>Midpoint</label>
+    <input type="range" id="mid" min="0.2" max="0.8" step="0.01" value="0.5" />
+    <span class="val" id="midV">0.50</span>
+  </div>
+
+  <div class="row" id="rowP">
+    <label>Exponent p</label>
+    <input type="range" id="p" min="1" max="5" step="0.1" value="2" />
+    <span class="val" id="pV">2.0</span>
+  </div>
+
+  <button id="copy">Copy config (C snippet)</button>
+  <button class="secondary" id="copyJson">Copy JSON</button>
+
+  <pre id="output"></pre>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const cv = $('plot');
+  const ctx = cv.getContext('2d');
+
+  const params = {
+    kind: 'smootherstep',
+    maxPct: 100,
+    runPct: 50,
+    dead: 8,
+    k: 8,
+    mid: 0.5,
+    p: 2.0,
+  };
+
+  // Map sliders -> params
+  const inputs = {
+    kind: $('kind'),
+    maxPct: $('maxPct'),
+    runPct: $('runPct'),
+    dead: $('dead'),
+    k: $('k'),
+    mid: $('mid'),
+    p: $('p'),
+  };
+  const labels = {
+    maxPct: $('maxPctV'),
+    runPct: $('runPctV'),
+    dead:   $('deadV'),
+    k:      $('kV'),
+    mid:    $('midV'),
+    p:      $('pV'),
+  };
+
+  function syncFromUI() {
+    params.kind   = inputs.kind.value;
+    params.maxPct = +inputs.maxPct.value;
+    params.runPct = +inputs.runPct.value;
+    params.dead   = +inputs.dead.value;
+    params.k      = +inputs.k.value;
+    params.mid    = +inputs.mid.value;
+    params.p      = +inputs.p.value;
+    labels.maxPct.textContent = params.maxPct;
+    labels.runPct.textContent = params.runPct;
+    labels.dead.textContent   = params.dead;
+    labels.k.textContent      = params.k;
+    labels.mid.textContent    = params.mid.toFixed(2);
+    labels.p.textContent      = params.p.toFixed(1);
+    $('rowK').style.opacity   = (params.kind === 'logistic') ? 1 : 0.3;
+    $('rowMid').style.opacity = (params.kind === 'logistic') ? 1 : 0.3;
+    $('rowP').style.opacity   = (params.kind === 'power') ? 1 : 0.3;
+    draw();
+    updateOutput();
+  }
+
+  // Curve: input |stick| in [0,1] -> output [0,1]
+  function curve(x) {
+    const d = params.dead / 100;
+    if (x <= d) return 0;
+    // Remap stick past deadzone to [0,1]
+    let t = (x - d) / (1 - d);
+    t = Math.max(0, Math.min(1, t));
+    let y;
+    switch (params.kind) {
+      case 'linear':
+        y = t;
+        break;
+      case 'smoothstep':
+        y = t * t * (3 - 2 * t);
+        break;
+      case 'smootherstep':
+        y = t * t * t * (t * (t * 6 - 15) + 10);
+        break;
+      case 'logistic': {
+        const k = params.k, m = params.mid;
+        // Logistic normalized to pass (0,0) and (1,1)
+        const sig = u => 1 / (1 + Math.exp(-k * (u - m)));
+        const a = sig(0), b = sig(1);
+        y = (sig(t) - a) / (b - a);
+        break;
+      }
+      case 'power':
+        y = Math.pow(t, params.p);
+        break;
+      default: y = t;
+    }
+    return y * (params.maxPct / 100) * (params.runPct / 100);
+  }
+
+  function curveShape(x) {
+    // Shape only (no runPct), for ref outline
+    const d = params.dead / 100;
+    if (x <= d) return 0;
+    let t = (x - d) / (1 - d);
+    t = Math.max(0, Math.min(1, t));
+    let y;
+    switch (params.kind) {
+      case 'linear': y = t; break;
+      case 'smoothstep': y = t * t * (3 - 2 * t); break;
+      case 'smootherstep': y = t * t * t * (t * (t * 6 - 15) + 10); break;
+      case 'logistic': {
+        const k = params.k, m = params.mid;
+        const sig = u => 1 / (1 + Math.exp(-k * (u - m)));
+        const a = sig(0), b = sig(1);
+        y = (sig(t) - a) / (b - a);
+        break;
+      }
+      case 'power': y = Math.pow(t, params.p); break;
+      default: y = t;
+    }
+    return y * (params.maxPct / 100);
+  }
+
+  function draw() {
+    const W = cv.width, H = cv.height;
+    const pad = 28;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 10; i++) {
+      const x = pad + (W - 2*pad) * i / 10;
+      const y = H - pad - (H - 2*pad) * i / 10;
+      ctx.beginPath(); ctx.moveTo(x, pad); ctx.lineTo(x, H - pad); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
+    }
+
+    // Axes
+    ctx.strokeStyle = '#666';
+    ctx.beginPath();
+    ctx.moveTo(pad, pad); ctx.lineTo(pad, H - pad); ctx.lineTo(W - pad, H - pad);
+    ctx.stroke();
+
+    ctx.fillStyle = '#888';
+    ctx.font = '11px ui-monospace, Menlo, monospace';
+    ctx.fillText('stick', W - pad + 4, H - pad + 4);
+    ctx.fillText('out',  pad - 22, pad - 4);
+
+    // Linear reference (gray)
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(pad, H - pad);
+    ctx.lineTo(W - pad, pad);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Curve shape ceiling (curve max, runPct=100) — dim white outline
+    ctx.strokeStyle = '#666';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i <= 400; i++) {
+      const t = i / 400;
+      const v = curveShape(t);
+      const px = pad + (W - 2*pad) * t;
+      const py = H - pad - (H - 2*pad) * v;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // Effective curve (with runPct applied) — bright white
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i <= 400; i++) {
+      const t = i / 400;
+      const v = curve(t);
+      const px = pad + (W - 2*pad) * t;
+      const py = H - pad - (H - 2*pad) * v;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // Marker at stick=0.5
+    const t = 0.5, v = curve(t);
+    const mx = pad + (W - 2*pad) * t;
+    const my = H - pad - (H - 2*pad) * v;
+    ctx.fillStyle = '#ff0';
+    ctx.beginPath(); ctx.arc(mx, my, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ff0';
+    ctx.fillText(`stick=0.5 -> ${v.toFixed(3)}`, mx + 8, my - 6);
+  }
+
+  function asCSnippet() {
+    const kindEnum = {
+      linear: 0, smoothstep: 1, smootherstep: 2, logistic: 3, power: 4,
+    }[params.kind];
+    return [
+      '// generated by docs/curve-visualizer.html',
+      `static const int   CURVE_KIND     = ${kindEnum};  // 0=lin 1=ss 2=sss 3=logistic 4=power`,
+      `static const float CURVE_MAX      = ${(params.maxPct/100).toFixed(3)}f;`,
+      `static const float CURVE_DEADZONE = ${(params.dead/100).toFixed(3)}f;`,
+      `static const float CURVE_K        = ${params.k.toFixed(2)}f;`,
+      `static const float CURVE_MID      = ${params.mid.toFixed(3)}f;`,
+      `static const float CURVE_P        = ${params.p.toFixed(2)}f;`,
+    ].join('\n');
+  }
+
+  function asJSON() {
+    return JSON.stringify({
+      kind: params.kind,
+      max: params.maxPct / 100,
+      deadzone: params.dead / 100,
+      k: params.k,
+      mid: params.mid,
+      p: params.p,
+    }, null, 2);
+  }
+
+  function updateOutput() {
+    $('output').textContent = asCSnippet();
+  }
+
+  $('copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(asCSnippet());
+    $('copy').textContent = 'Copied!';
+    setTimeout(() => $('copy').textContent = 'Copy config (C snippet)', 1200);
+  });
+  $('copyJson').addEventListener('click', () => {
+    navigator.clipboard.writeText(asJSON());
+    $('copyJson').textContent = 'Copied!';
+    setTimeout(() => $('copyJson').textContent = 'Copy JSON', 1200);
+  });
+
+  Object.values(inputs).forEach(el => el.addEventListener('input', syncFromUI));
+  syncFromUI();
+})();
+</script>
+
+</body>
+</html>
