@@ -127,9 +127,11 @@ static void pidStep(const int32_t cmd[4], float dt) {
     float targetTps = ((float)cmd[i] / 1000.0f) * MAX_TPS;
 
     if (cmd[i] == 0) {
-      // Hard stop: drain integral so motor doesn't creep.
       pid[i].integral = 0.0f;
       motorWrite(i, 0);
+      lastTargetTps[i] = 0;
+      lastMeasTps[i]   = measuredTps;
+      lastOutPwm[i]    = 0;
       continue;
     }
 
@@ -147,6 +149,132 @@ static void pidStep(const int32_t cmd[4], float dt) {
     lastMeasTps[i]   = measuredTps;
     lastOutPwm[i]    = out;
   }
+}
+
+// ---------------- Test mode (serial command driven) ----------------
+// Active when any test command (m/t/s/r) is received over USB serial.
+// Bypasses ESP-NOW watchdog so the live controller cannot interfere.
+// Telemetry: prints `TLM ...` line at 20Hz while testMode==true.
+// Commands:
+//   m <slot> <pwm>          direct motor write, bypass kinematics+PID (slot 0..3, pwm -1023..+1023)
+//   t <vx> <vy> <omega>     full pipeline (each -1000..+1000)
+//   s                       stop all motors, zero PID
+//   r                       zero encoder counters, zero PID
+//   x                       exit test mode (return to ESP-NOW control)
+//   ?                       print one-shot status
+enum TestInput : uint8_t { TI_NONE, TI_DIRECT, TI_MECANUM };
+static bool      testMode    = false;
+static TestInput testInput   = TI_NONE;
+static int16_t   slotPwm[4]  = { 0, 0, 0, 0 };
+static int16_t   testVx = 0, testVy = 0, testOmega = 0;
+
+static char      cmdBuf[64];
+static uint8_t   cmdLen = 0;
+
+static long      prevEnc[4]  = { 0, 0, 0, 0 };
+static uint32_t  prevTlmMs   = 0;
+static uint32_t  lastTlmMs   = 0;
+
+static int16_t clampPwm(int v) { return (int16_t)constrain(v, -PWM_MAX, PWM_MAX); }
+static int16_t clampCmd(int v) { return (int16_t)constrain(v, -1000, 1000); }
+
+static void handleCommand(char* line) {
+  char* tok = strtok(line, " \t");
+  if (!tok) return;
+  char c = (char)tolower((unsigned char)tok[0]);
+  switch (c) {
+    case 'm': {
+      char* a = strtok(NULL, " \t");
+      char* b = strtok(NULL, " \t");
+      if (!a || !b) { Serial.println("ERR usage: m <slot> <pwm>"); return; }
+      int slot = atoi(a);
+      if (slot < 0 || slot > 3) { Serial.println("ERR slot 0..3"); return; }
+      testMode = true;
+      testInput = TI_DIRECT;
+      slotPwm[slot] = clampPwm(atoi(b));
+      Serial.printf("OK m %d %d\n", slot, slotPwm[slot]);
+      break;
+    }
+    case 't': {
+      char* a = strtok(NULL, " \t");
+      char* b = strtok(NULL, " \t");
+      char* d = strtok(NULL, " \t");
+      if (!a || !b || !d) { Serial.println("ERR usage: t <vx> <vy> <omega>"); return; }
+      testVx    = clampCmd(atoi(a));
+      testVy    = clampCmd(atoi(b));
+      testOmega = clampCmd(atoi(d));
+      testMode = true;
+      testInput = TI_MECANUM;
+      Serial.printf("OK t %d %d %d\n", testVx, testVy, testOmega);
+      break;
+    }
+    case 's':
+      testMode = true;
+      testInput = TI_NONE;
+      for (int i = 0; i < 4; i++) slotPwm[i] = 0;
+      motorStopAll();
+      pidReset();
+      Serial.println("OK s");
+      break;
+    case 'r':
+      noInterrupts();
+      for (int i = 0; i < 4; i++) encCount[i] = 0;
+      interrupts();
+      pidReset();
+      for (int i = 0; i < 4; i++) prevEnc[i] = 0;
+      Serial.println("OK r");
+      break;
+    case 'x':
+      testMode = false;
+      testInput = TI_NONE;
+      for (int i = 0; i < 4; i++) slotPwm[i] = 0;
+      motorStopAll();
+      pidReset();
+      Serial.println("OK x");
+      break;
+    case '?':
+      Serial.printf("STATUS testMode=%d input=%d slot=[%d %d %d %d] t=[%d %d %d]\n",
+                    testMode ? 1 : 0, (int)testInput,
+                    slotPwm[0], slotPwm[1], slotPwm[2], slotPwm[3],
+                    testVx, testVy, testOmega);
+      break;
+    default:
+      Serial.printf("ERR unknown '%c'\n", c);
+  }
+}
+
+static void pollSerial() {
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      cmdBuf[cmdLen] = '\0';
+      if (cmdLen > 0) handleCommand(cmdBuf);
+      cmdLen = 0;
+      continue;
+    }
+    if (cmdLen < sizeof(cmdBuf) - 1) cmdBuf[cmdLen++] = (char)c;
+  }
+}
+
+static void emitTlm(uint32_t now) {
+  uint32_t dt_ms = (prevTlmMs == 0) ? 50 : (now - prevTlmMs);
+  if (dt_ms == 0) dt_ms = 1;
+  float dt = dt_ms / 1000.0f;
+  long cnt[4], delta[4];
+  for (int i = 0; i < 4; i++) {
+    cnt[i]    = readCountAtomic(i);
+    delta[i]  = cnt[i] - prevEnc[i];
+    prevEnc[i] = cnt[i];
+  }
+  prevTlmMs = now;
+  Serial.printf("TLM ms=%lu cmd=[%d %d %d %d] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]\n",
+                (unsigned long)now,
+                slotPwm[0], slotPwm[1], slotPwm[2], slotPwm[3],
+                lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
+                (float)delta[0]/dt, (float)delta[1]/dt, (float)delta[2]/dt, (float)delta[3]/dt,
+                cnt[0], cnt[1], cnt[2], cnt[3]);
 }
 
 // ---------------- ESP-NOW receive ----------------
@@ -208,27 +336,53 @@ static bool     wasStopped  = true;
 
 void loop() {
   uint32_t now = millis();
+  pollSerial();
 
   if (now - lastDriveMs >= 10) {
     float dt = (now - lastDriveMs) / 1000.0f;
     if (dt <= 0.0f) dt = 0.01f;
     lastDriveMs = now;
 
-    CtrlPacket p;
-    uint32_t age;
-    portENTER_CRITICAL(&pktMux);
-    p   = lastPacket;
-    age = now - lastPacketMs;
-    portEXIT_CRITICAL(&pktMux);
-
-    if (age > 500 || (p.flags & 0x01)) {
-      if (!wasStopped) { motorStopAll(); pidReset(); wasStopped = true; }
-    } else {
-      int32_t cmd[4];
-      mecanumMix(p.vx, p.vy, p.omega, cmd);
-      pidStep(cmd, dt);
+    if (testMode) {
+      if (testInput == TI_DIRECT) {
+        for (int i = 0; i < 4; i++) {
+          motorWrite(i, slotPwm[i]);
+          lastOutPwm[i] = (float)slotPwm[i];
+        }
+      } else if (testInput == TI_MECANUM) {
+        int32_t cmd[4];
+        mecanumMix(testVx, testVy, testOmega, cmd);
+        pidStep(cmd, dt);
+      } else {
+        motorStopAll();
+        for (int i = 0; i < 4; i++) lastOutPwm[i] = 0;
+      }
       wasStopped = false;
+    } else {
+      CtrlPacket p;
+      uint32_t age;
+      portENTER_CRITICAL(&pktMux);
+      p   = lastPacket;
+      age = now - lastPacketMs;
+      portEXIT_CRITICAL(&pktMux);
+
+      if (age > 500 || (p.flags & 0x01)) {
+        if (!wasStopped) { motorStopAll(); pidReset(); wasStopped = true; }
+      } else {
+        int32_t cmd[4];
+        mecanumMix(p.vx, p.vy, p.omega, cmd);
+        pidStep(cmd, dt);
+        wasStopped = false;
+      }
     }
+  }
+
+  if (testMode) {
+    if (now - lastTlmMs >= 50) {
+      lastTlmMs = now;
+      emitTlm(now);
+    }
+    return;
   }
 
   if (now - lastLogMs >= 500) {
@@ -242,10 +396,11 @@ void loop() {
     bool fresh = age < 500 && p.seq != lastSeen;
     int32_t cmd[4];
     mecanumMix(p.vx, p.vy, p.omega, cmd);
-    Serial.printf("seq=%lu age=%lums vx=%d vy=%d w=%d cmd=[%ld %ld %ld %ld] M1: tgt=%.0f meas=%.0f pwm=%.0f%s\n",
-                  (unsigned long)p.seq, (unsigned long)age, p.vx, p.vy, p.omega,
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f]%s\n",
+                  (unsigned long)p.seq, p.vx, p.vy, p.omega,
                   (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
-                  lastTargetTps[0], lastMeasTps[0], lastOutPwm[0],
+                  lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
+                  lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
                   fresh ? "" : " (stale)");
     lastSeen = p.seq;
   }

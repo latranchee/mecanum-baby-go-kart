@@ -13,15 +13,20 @@
 //   0x70 [4B]: LeftBtn, RightBtn, LeftJoyBtn, RightJoyBtn (1B each, 1=released)
 
 static const uint8_t JOY_ADDR    = 0x59;
-static const uint8_t REG_STICK_L = 0x00;
-static const uint8_t REG_STICK_R = 0x20;
-static const uint8_t REG_BTNS    = 0x70;
+// Reg map (matches user's physical sticks, validated by on-screen debug):
+//   0x00 -> physical LEFT  stick
+//   0x20 -> physical RIGHT stick
+// Within each reg: bytes 0-1 = HORIZ axis (left/right tilt), bytes 2-3 = VERT axis (up/down tilt).
+static const uint8_t REG_STICK_LEFT_PHYS  = 0x00;
+static const uint8_t REG_STICK_RIGHT_PHYS = 0x20;
+static const uint8_t REG_BTNS             = 0x70;
 
 static const int I2C_SDA = 38;
 static const int I2C_SCL = 39;
 
-static uint16_t centerLX = 2048, centerLY = 2048;
-static uint16_t centerRX = 2048, centerRY = 2048;
+// "Left/Right" below = USER's physical sticks (not M5 reg labels — see above).
+static uint16_t centerLHoriz = 2048, centerLVert = 2048;
+static uint16_t centerRHoriz = 2048, centerRVert = 2048;
 
 static const int16_t DEADZONE_RAW = 80;
 static const int32_t HALF_RANGE   = 2000;
@@ -65,11 +70,12 @@ static bool readRegs(uint8_t reg, uint8_t* buf, uint8_t n) {
   return true;
 }
 
-static bool readStick(uint8_t reg, uint16_t* x, uint16_t* y) {
+// I2C reg layout (per on-screen debug): bytes 0-1 = HORIZ axis, bytes 2-3 = VERT axis.
+static bool readStick(uint8_t reg, uint16_t* horiz, uint16_t* vert) {
   uint8_t b[4];
   if (!readRegs(reg, b, 4)) return false;
-  *x = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
-  *y = (uint16_t)b[2] | ((uint16_t)b[3] << 8);
+  *horiz = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+  *vert  = (uint16_t)b[2] | ((uint16_t)b[3] << 8);
   return true;
 }
 
@@ -86,24 +92,27 @@ static int16_t normalize(uint16_t raw, uint16_t center) {
 }
 
 static void calibrateCenter() {
-  uint32_t sumLX = 0, sumLY = 0, sumRX = 0, sumRY = 0;
+  uint32_t sumLH = 0, sumLV = 0, sumRH = 0, sumRV = 0;
   const int N = 16;
   int ok = 0;
   for (int i = 0; i < N; i++) {
-    uint16_t lx, ly, rx, ry;
-    if (readStick(REG_STICK_L, &lx, &ly) && readStick(REG_STICK_R, &rx, &ry)) {
-      sumLX += lx; sumLY += ly; sumRX += rx; sumRY += ry;
+    uint16_t lh, lv, rh, rv;
+    // PHYS_LEFT reg holds user's left stick; PHYS_RIGHT reg holds user's right stick.
+    if (readStick(REG_STICK_LEFT_PHYS,  &lh, &lv) &&
+        readStick(REG_STICK_RIGHT_PHYS, &rh, &rv)) {
+      sumLH += lh; sumLV += lv; sumRH += rh; sumRV += rv;
       ok++;
     }
     delay(10);
   }
   if (ok > 0) {
-    centerLX = sumLX / ok;
-    centerLY = sumLY / ok;
-    centerRX = sumRX / ok;
-    centerRY = sumRY / ok;
+    centerLHoriz = sumLH / ok;
+    centerLVert  = sumLV / ok;
+    centerRHoriz = sumRH / ok;
+    centerRVert  = sumRV / ok;
   }
-  Serial.printf("Centers: L=(%u,%u) R=(%u,%u) n=%d\n", centerLX, centerLY, centerRX, centerRY, ok);
+  Serial.printf("Centers: L=(h%u,v%u) R=(h%u,v%u) n=%d\n",
+                centerLHoriz, centerLVert, centerRHoriz, centerRVert, ok);
 }
 
 // ---------------- ESP-NOW ----------------
@@ -164,33 +173,43 @@ static void drawHeader() {
 
 static void drawStatus(bool connected) {
   uint16_t bg = connected ? TFT_DARKGREEN : TFT_RED;
-  M5.Display.fillRect(0, 18, 128, 28, bg);
+  M5.Display.fillRect(0, 16, 128, 16, bg);
   M5.Display.setTextColor(TFT_WHITE, bg);
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextSize(2);
-  M5.Display.drawString(connected ? "ONLINE" : "OFFLINE", 64, 32);
+  M5.Display.drawString(connected ? "ONLINE" : "OFFLINE", 64, 24);
 }
 
-static void drawSpeed(uint8_t pct) {
-  M5.Display.fillRect(0, 50, 128, 50, TFT_BLACK);
-  M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-  M5.Display.setTextDatum(middle_center);
+static void drawSpeedCompact(uint8_t pct) {
+  M5.Display.fillRect(0, 34, 128, 10, TFT_BLACK);
+  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(1);
-  M5.Display.drawString("MAX SPEED", 64, 56);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%u%%", pct);
-  M5.Display.setTextSize(4);
-  M5.Display.drawString(buf, 64, 82);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "SPD %u%%", pct);
+  M5.Display.drawString(buf, 4, 35);
 }
 
-static void drawFooter(uint32_t seq) {
-  M5.Display.fillRect(0, 110, 128, 18, TFT_BLACK);
+// Physical-deflection labels (sign convention validated by working code):
+//   vert: normalize > 0 => stick DOWN (raw above center)
+//   horiz: normalize > 0 => stick RIGHT
+static const char* vertLabel(int n)  { return (n > 0) ? "DN" : ((n < 0) ? "UP" : "--"); }
+static const char* horizLabel(int n) { return (n > 0) ? "RT" : ((n < 0) ? "LT" : "--"); }
+
+static void drawSticks(int16_t lVertN, int16_t lHorizN, int16_t rVertN, int16_t rHorizN) {
+  M5.Display.fillRect(0, 46, 128, 82, TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextSize(1);
-  char buf[24];
-  snprintf(buf, sizeof(buf), "seq %lu", (unsigned long)seq);
-  M5.Display.drawString(buf, 64, 119);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextSize(2);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "L V:%s%3d", vertLabel(lVertN),   abs(lVertN)/10);
+  M5.Display.drawString(buf, 2, 48);
+  snprintf(buf, sizeof(buf), "L H:%s%3d", horizLabel(lHorizN), abs(lHorizN)/10);
+  M5.Display.drawString(buf, 2, 68);
+  snprintf(buf, sizeof(buf), "R V:%s%3d", vertLabel(rVertN),   abs(rVertN)/10);
+  M5.Display.drawString(buf, 2, 88);
+  snprintf(buf, sizeof(buf), "R H:%s%3d", horizLabel(rHorizN), abs(rHorizN)/10);
+  M5.Display.drawString(buf, 2, 108);
 }
 
 static void initDisplay() {
@@ -198,8 +217,8 @@ static void initDisplay() {
   M5.Display.fillScreen(TFT_BLACK);
   drawHeader();
   drawStatus(false);
-  drawSpeed(speedPct);
-  drawFooter(0);
+  drawSpeedCompact(speedPct);
+  drawSticks(0, 0, 0, 0);
 }
 
 void setup() {
@@ -231,10 +250,10 @@ void loop() {
   if (now - lastSendMs < 20) return;
   lastSendMs = now;
 
-  uint16_t lx, ly, rx, ry;
+  uint16_t lHoriz, lVert, rHoriz, rVert;
   uint8_t  btns[4] = { 1, 1, 1, 1 };
-  bool ok = readStick(REG_STICK_L, &lx, &ly) &&
-            readStick(REG_STICK_R, &rx, &ry) &&
+  bool ok = readStick(REG_STICK_LEFT_PHYS,  &lHoriz, &lVert) &&
+            readStick(REG_STICK_RIGHT_PHYS, &rHoriz, &rVert) &&
             readButtons(btns);
   if (!ok) return;
 
@@ -251,15 +270,23 @@ void loop() {
   if (pressed & 0x01) speedPct = (speedPct <=  10) ?  10 : speedPct - 10;
   lastBtnMask = btnMask;
 
-  // Stick mapping (physical layout — left/right sticks swapped vs I2C reg labels):
-  //   LEFT  stick: Y -> vx (forward+), X -> vy (strafe right+)
-  //   RIGHT stick: Y -> vx (forward+), X -> omega (CCW+)
-  int16_t vx_raw    = -normalize(ry, centerRY);   // "left" physical = REG_STICK_R
-  int16_t vy_raw    =  normalize(rx, centerRX);
-  int16_t vx_r      = -normalize(ly, centerLY);   // "right" physical = REG_STICK_L
-  int16_t omega_raw = -normalize(lx, centerLX);
-  // Combine fwd/back from either stick (whichever larger).
-  if (abs(vx_r) > abs(vx_raw)) vx_raw = vx_r;
+  // Normalize stick deflections to [-1000..+1000]. Names reflect actual physical axes.
+  int16_t lHorizN = normalize(lHoriz, centerLHoriz);
+  int16_t lVertN  = normalize(lVert,  centerLVert);
+  int16_t rHorizN = normalize(rHoriz, centerRHoriz);
+  int16_t rVertN  = normalize(rVert,  centerRVert);
+
+  // Stick -> robot mapping (BEHAVIOR PRESERVED from pre-rename code).
+  // Note: these bindings are intentionally non-intuitive — fix in a follow-up if needed.
+  //   RIGHT HORIZ -> vx primary  (forward+)
+  //   RIGHT VERT  -> vy          (strafe right+)
+  //   LEFT  VERT  -> omega       (CCW+)
+  //   LEFT  HORIZ -> vx alt      (combined with primary, larger magnitude wins)
+  int16_t vx_raw    = -rHorizN;
+  int16_t vy_raw    =  rVertN;
+  int16_t omega_raw = -lVertN;
+  int16_t vx_alt    = -lHorizN;
+  if (abs(vx_alt) > abs(vx_raw)) vx_raw = vx_alt;
 
   // Apply S-curve then scale by speedPct (top-end limit).
   float scale = (float)speedPct / 100.0f;
@@ -274,7 +301,7 @@ void loop() {
   CtrlPacket pkt = { ++seq, vx, vy, omega, btnMask, flags };
   if (peerAdded) esp_now_send(ROBOT_MAC, (uint8_t*)&pkt, sizeof(pkt));
 
-  // Display refresh @ ~10Hz, only redraw changed sections
+  // Display refresh @ ~10Hz: status/speed only on change, sticks every tick.
   if (now - lastDispMs >= 100) {
     lastDispMs = now;
     bool connected = (now - lastAckMs) < 500;
@@ -283,17 +310,18 @@ void loop() {
       lastConnected = connected;
     }
     if (speedPct != lastSpeedPct) {
-      drawSpeed(speedPct);
+      drawSpeedCompact(speedPct);
       lastSpeedPct = speedPct;
     }
-    drawFooter(seq);
+    drawSticks(lVertN, lHorizN, rVertN, rHorizN);
   }
 
   // Serial log @ 5Hz
   if (now - lastLogMs >= 200) {
     lastLogMs = now;
-    Serial.printf("seq=%lu spd=%u%% btn=%02X conn=%d -> vx=%d vy=%d w=%d\n",
+    Serial.printf("seq=%lu spd=%u%% btn=%02X conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
                   (unsigned long)seq, speedPct, btnMask,
-                  (now - lastAckMs) < 500 ? 1 : 0, vx, vy, omega);
+                  (now - lastAckMs) < 500 ? 1 : 0,
+                  lHoriz, lVert, rHoriz, rVert, vx, vy, omega);
   }
 }
