@@ -276,16 +276,16 @@ void loop() {
   int16_t rHorizN = normalize(rHoriz, centerRHoriz);
   int16_t rVertN  = normalize(rVert,  centerRVert);
 
-  // Stick -> robot mapping (BEHAVIOR PRESERVED from pre-rename code).
-  // Note: these bindings are intentionally non-intuitive — fix in a follow-up if needed.
-  //   RIGHT HORIZ -> vx primary  (forward+)
-  //   RIGHT VERT  -> vy          (strafe right+)
-  //   LEFT  VERT  -> omega       (CCW+)
-  //   LEFT  HORIZ -> vx alt      (combined with primary, larger magnitude wins)
-  int16_t vx_raw    = -rHorizN;
-  int16_t vy_raw    =  rVertN;
-  int16_t omega_raw = -lVertN;
-  int16_t vx_alt    = -lHorizN;
+  // Stick -> robot mapping.
+  //   LEFT  stick: VERT (UP=fwd)    -> vx primary
+  //                HORIZ (RIGHT=R)  -> vy (strafe right)
+  //   RIGHT stick: VERT (UP=fwd)    -> vx alt (arbiter: larger magnitude wins)
+  //                HORIZ (RIGHT=CW) -> omega (CW = negative; protocol: omega>0 CCW)
+  // normalize() returns +DOWN / +RIGHT (see lines 193-195), so UP requires negation.
+  int16_t vx_raw    = -lVertN;
+  int16_t vy_raw    =  lHorizN;
+  int16_t omega_raw = -rHorizN;
+  int16_t vx_alt    = -rVertN;
   if (abs(vx_alt) > abs(vx_raw)) vx_raw = vx_alt;
 
   // Apply S-curve then scale by speedPct (top-end limit).
