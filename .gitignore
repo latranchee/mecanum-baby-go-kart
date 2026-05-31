@@ -4,3 +4,4 @@
 .claude/
 include/secrets.h
 tools/logs/
+__pycache__/

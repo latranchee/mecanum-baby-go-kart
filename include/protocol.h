@@ -12,7 +12,14 @@ struct __attribute__((packed)) CtrlPacket {
   uint8_t  flags;     // bit0=estop
 };
 
-static const uint8_t ROBOT_MAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0xDB, 0x18 };
+// Robot MAC + ESP-NOW keys live in secrets.h (gitignored). A fresh clone with no
+// secrets.h still builds via the fallback below. Copy secrets.h.example ->
+// secrets.h and fill in your robot's real MAC (and keys, for #3 encryption).
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  static const uint8_t ROBOT_MAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0xDB, 0x18 };
+#endif
 
 // Shared WiFi channel for ESP-NOW (no AP needed, but channel must match)
 static const uint8_t ESPNOW_CHANNEL = 1;
