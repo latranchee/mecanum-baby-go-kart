@@ -41,6 +41,11 @@ static volatile long encCount[4] = { 0, 0, 0, 0 };
 // Derived from solo-PWM test: +PWM raw_tps signs [-, +, -, +] for [FL,FR,RL,RR].
 static const int8_t encSign[4]   = { -1, +1, -1, +1 };
 
+// FR (slot 1) encoder is dead (HW wiring on GPIO 16/4). Run that wheel open-loop:
+// pure feed-forward PWM, no P/I — otherwise the PID sees measured=0, computes a
+// huge error and over-drives FR to saturation. Others stay closed-loop.
+static const bool openLoop[4] = { false, true, false, false };
+
 static void IRAM_ATTR encISR0() { if (digitalRead(motors[0].encB)) encCount[0]--; else encCount[0]++; }
 static void IRAM_ATTR encISR1() { if (digitalRead(motors[1].encB)) encCount[1]--; else encCount[1]++; }
 static void IRAM_ATTR encISR2() { if (digitalRead(motors[2].encB)) encCount[2]--; else encCount[2]++; }
@@ -150,6 +155,20 @@ static void pidStep(const int32_t cmd[4], float dt) {
       lastTargetTps[i] = 0;
       lastMeasTps[i]   = measuredTps;
       lastOutPwm[i]    = 0;
+      continue;
+    }
+
+    // Dead-encoder wheels: open-loop feed-forward only. No error term (measured
+    // is meaningless), so PWM tracks the commanded speed directly.
+    if (openLoop[i]) {
+      float out = Kff * targetTps;
+      out = constrain(out, -(float)PWM_MAX, (float)PWM_MAX);
+      motorWrite(i, (int16_t)out);
+      pid[i].integral  = 0.0f;
+      pid[i].lastCount = now;
+      lastTargetTps[i] = targetTps;
+      lastMeasTps[i]   = 0.0f;
+      lastOutPwm[i]    = out;
       continue;
     }
 
@@ -325,6 +344,18 @@ static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len != sizeof(CtrlPacket)) return;
   if (testMode) return;  // ignore ESP-NOW while serial-injected test packet is active
+
+  // Drop stale/duplicate/reordered frames: accept only a newer seq. The int32
+  // cast makes the compare wrap-safe at 2^32. A large backward jump (>=1000)
+  // means the controller rebooted (seq restarts near 0) — resync rather than
+  // lock the link out, since lastSeq would otherwise reject every fresh frame.
+  static uint32_t lastSeq = 0;
+  uint32_t incoming;
+  memcpy(&incoming, data, sizeof(incoming));  // seq is the first field
+  int32_t d = (int32_t)(incoming - lastSeq);
+  if (d <= 0 && d > -1000) return;
+  lastSeq = incoming;
+
   portENTER_CRITICAL(&pktMux);
   memcpy(&lastPacket, data, sizeof(CtrlPacket));
   lastPacketMs = millis();
