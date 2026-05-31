@@ -16,18 +16,20 @@ struct Motor {
   uint8_t encB;
 };
 
-// Slot i drives physical wheel i (validated by solo-PWM observation: slot 0
-// +PWM=FL fwd, slot 1=FR fwd, slot 2=RL fwd, slot 3=RR fwd). Motor pin set
-// (PWM/inA/inB) was reordered from the original permuted wiring; inA/inB
-// swapped on FR (slot 1) and RL (slot 2) to align motor direction.
-// Encoder pin pairs (encA/encB) followed an INDEPENDENT permutation on the
-// board: pins (13,17) read FL's encoder, pins (16,4) read FR's encoder
-// (i.e. slots 0 and 1 encoder pin pairs are swapped relative to their motors).
+// Slot i drives physical wheel i. Validated by solo-PWM observation.
+// 2026-05-31 body swap: rear motors physically traded corners (the old slot 2
+// hardware now sits at RR, old slot 3 hardware at RL) and both ran backward on
+// +PWM. Wires too short to re-route, so fixed in software: rear array entries
+// swapped (so each index drives its true corner) and inA/inB swapped on both
+// rear entries to invert direction (+cmd -> forward). Front pair unchanged.
+// Encoder pin pairs (encA/encB) travel with their motor, so encSign[] is
+// unchanged. NOTE: FR (slot 1) encoder reads 0 (dead wiring on GPIO 16/4) —
+// hardware fix still pending; PID drives FR open-loop via feed-forward.
 static const Motor motors[4] = {
   { 18,  5, 19, 13, 17 },  // FL  motor=(18, 5,19)  encoder=(13,17)
-  { 21, 23, 22, 16,  4 },  // FR  motor=(21,23,22)  encoder=(16, 4) [inA<->inB swapped from M4]
-  { 26, 14, 32, 35, 34 },  // RL  motor=(26,14,32)  encoder=(35,34) [inA<->inB swapped from M2]
-  { 25, 33, 27, 39, 36 },  // RR  motor=(25,33,27)  encoder=(39,36)
+  { 21, 23, 22, 16,  4 },  // FR  motor=(21,23,22)  encoder=(16, 4) [encoder dead - HW]
+  { 25, 27, 33, 39, 36 },  // RL  was old-slot3 hw=(25,33,27); inA<->inB swapped to invert  encoder=(39,36)
+  { 26, 32, 14, 35, 34 },  // RR  was old-slot2 hw=(26,14,32); inA<->inB swapped to invert  encoder=(35,34)
 };
 
 static const int PWM_FREQ = 25000;
