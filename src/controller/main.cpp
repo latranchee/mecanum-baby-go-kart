@@ -279,14 +279,13 @@ void loop() {
   // Stick -> robot mapping.
   //   LEFT  stick: VERT (UP=fwd)    -> vx primary
   //                HORIZ (RIGHT=R)  -> vy (strafe right)
-  //   RIGHT stick: VERT (UP=fwd)    -> vx alt (arbiter: larger magnitude wins)
+  //   RIGHT stick: VERT (UP=fwd)    -> vx add (both stick verts sum)
   //                HORIZ (RIGHT=CW) -> omega (CW = negative; protocol: omega>0 CCW)
   // normalize() returns +DOWN / +RIGHT (see lines 193-195), so UP requires negation.
-  int16_t vx_raw    = -lVertN;
   int16_t vy_raw    =  lHorizN;
   int16_t omega_raw = -rHorizN;
-  int16_t vx_alt    = -rVertN;
-  if (abs(vx_alt) > abs(vx_raw)) vx_raw = vx_alt;
+  // vx: sum both stick verts, clamp to normalized range (opposing pushes cancel).
+  int16_t vx_raw    = (int16_t)constrain((int32_t)(-lVertN) + (int32_t)(-rVertN), -1000, 1000);
 
   // Apply S-curve then scale by speedPct (top-end limit).
   float scale = (float)speedPct / 100.0f;

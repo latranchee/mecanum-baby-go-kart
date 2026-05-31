@@ -98,14 +98,21 @@ static void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t outCmd[4])
 static const float MAX_TPS = 2100.0f;          // max wheel speed (ticks/sec) used to scale cmd
 static const float Kff     = (float)PWM_MAX / MAX_TPS;  // ~0.487 — feed-forward gain
 static const float Kp      = 0.15f;
-static const float Ki      = 0.0f;             // disabled — windup pushed PWM to saturation
-static const float I_MAX   = (float)PWM_MAX;
+static const float Ki      = 0.4f;             // re-enabled with conditional-integration anti-windup
+static const float I_MAX   = 0.6f * (float)PWM_MAX;  // bound integral authority (~614)
 
 struct PidState {
   float  integral;
   long   lastCount;
 };
 static PidState pid[4] = {};
+
+// Command slew limiter: ramp each wheel cmd toward its mix target instead of
+// stepping instantly. Four motors slamming 0->full at once draw near-stall
+// current simultaneously (no back-EMF yet) and collapse a weak supply rail —
+// worst during spin-in-place. Ramping staggers the current rise.
+static const float CMD_SLEW = 4000.0f;  // cmd units/sec (full 0..1000 in ~250ms)
+static int32_t curCmd[4] = { 0, 0, 0, 0 };
 
 // Last PID step values for telemetry (M1 only, to keep log short)
 static float lastTargetTps[4] = { 0, 0, 0, 0 };
@@ -123,6 +130,7 @@ static void pidReset() {
   for (int i = 0; i < 4; i++) {
     pid[i].integral  = 0.0f;
     pid[i].lastCount = readCountAtomic(i);
+    curCmd[i]        = 0;  // drop the slew ramp so resume starts from rest
   }
 }
 
@@ -146,9 +154,18 @@ static void pidStep(const int32_t cmd[4], float dt) {
     }
 
     float err = targetTps - measuredTps;
-    pid[i].integral += err * dt * Ki;
-    if (pid[i].integral >  I_MAX) pid[i].integral =  I_MAX;
-    if (pid[i].integral < -I_MAX) pid[i].integral = -I_MAX;
+
+    // Conditional-integration anti-windup: only accumulate when the output is
+    // not already saturated in the direction the error would push it. Stops
+    // the integral from running away while PWM is pinned (the old failure).
+    float pre = Kff * targetTps + Kp * err + pid[i].integral;
+    bool saturated = (pre >=  PWM_MAX && err > 0) ||
+                     (pre <= -PWM_MAX && err < 0);
+    if (!saturated) {
+      pid[i].integral += err * dt * Ki;
+      if (pid[i].integral >  I_MAX) pid[i].integral =  I_MAX;
+      if (pid[i].integral < -I_MAX) pid[i].integral = -I_MAX;
+    }
 
     float out = Kff * targetTps + Kp * err + pid[i].integral;
     if (out >  PWM_MAX) out =  PWM_MAX;
@@ -407,7 +424,16 @@ void loop() {
     } else {
       int32_t cmd[4];
       mecanumMix(p.vx, p.vy, p.omega, cmd);
-      pidStep(cmd, dt);
+      // Slew-limit toward target to cap simultaneous inrush current.
+      int32_t maxStep = (int32_t)(CMD_SLEW * dt);
+      if (maxStep < 1) maxStep = 1;
+      for (int i = 0; i < 4; i++) {
+        int32_t d = cmd[i] - curCmd[i];
+        if (d >  maxStep) d =  maxStep;
+        if (d < -maxStep) d = -maxStep;
+        curCmd[i] += d;
+      }
+      pidStep(curCmd, dt);
       wasStopped = false;
     }
   }
