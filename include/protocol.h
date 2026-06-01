@@ -25,3 +25,12 @@ struct __attribute__((packed)) CtrlPacket {
 
 // Shared WiFi channel for ESP-NOW (no AP needed, but channel must match)
 static const uint8_t ESPNOW_CHANNEL = 1;
+
+// ESP-NOW link encryption (#3). 0 = plaintext (default — no key coordination
+// needed). To enable: set to 1 on BOTH ends, flash robot+controller back-to-back
+// from the SAME secrets.h (ESPNOW_PMK/LMK + CONTROLLER_MAC), and verify ONLINE
+// before walking away. Mismatched/missing keys silently kill the link. Roll back
+// by setting this to 0 and reflashing.
+#ifndef ESPNOW_ENCRYPT
+#define ESPNOW_ENCRYPT 0
+#endif

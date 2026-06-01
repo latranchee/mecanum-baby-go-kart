@@ -410,6 +410,20 @@ static void setupEspNow() {
     Serial.println("ESP-NOW init FAILED");
     return;
   }
+
+#if ESPNOW_ENCRYPT
+  // Set the primary key, then register the controller as an encrypted peer so
+  // the robot will accept (and only accept) encrypted frames from it (#3).
+  esp_now_set_pmk((const uint8_t*)ESPNOW_PMK);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, CONTROLLER_MAC, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt = true;
+  memcpy(peer.lmk, ESPNOW_LMK, 16);
+  if (esp_now_add_peer(&peer) != ESP_OK) Serial.println("add controller peer FAILED");
+  Serial.println("ESP-NOW encryption ENABLED");
+#endif
+
   esp_now_register_recv_cb(onRecv);
   Serial.println("ESP-NOW listening");
 }

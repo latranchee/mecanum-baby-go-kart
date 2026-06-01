@@ -111,10 +111,19 @@ static void setupEspNow() {
   }
   esp_now_register_send_cb(onSent);
 
+#if ESPNOW_ENCRYPT
+  esp_now_set_pmk((const uint8_t*)ESPNOW_PMK);  // must precede add_peer (#3)
+#endif
+
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, ROBOT_MAC, 6);
   peer.channel = ESPNOW_CHANNEL;
+#if ESPNOW_ENCRYPT
+  peer.encrypt = true;
+  memcpy(peer.lmk, ESPNOW_LMK, 16);
+#else
   peer.encrypt = false;
+#endif
   if (esp_now_add_peer(&peer) == ESP_OK) {
     peerAdded = true;
     Serial.println("Peer added");
