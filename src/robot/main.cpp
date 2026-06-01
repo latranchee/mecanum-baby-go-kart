@@ -5,6 +5,7 @@
 #include "protocol.h"
 #include "config_robot.h"
 #include "kinematics.h"
+#include "control_math.h"   // crc8()
 
 // ---------------- Motor pin map (see docs/pinout.md) ----------------
 // Wheel layout (top-down view, robot facing forward):
@@ -318,26 +319,34 @@ static void emitTlm(uint32_t now) {
 
 // ---------------- ESP-NOW receive ----------------
 static volatile uint32_t lastPacketMs = 0;
-static CtrlPacket lastPacket = { 0, 0, 0, 0, 0, 0 };
+static CtrlPacket lastPacket = { 0, 0, 0, 0, 0, 0, 0 };
 static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t crcDrops = 0;  // count of frames rejected on bad CRC
 
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len != sizeof(CtrlPacket)) return;
   if (testMode) return;  // ignore ESP-NOW while serial-injected test packet is active
+
+  CtrlPacket in;
+  memcpy(&in, data, sizeof(in));
+
+  // Integrity (#4): drop frames whose crc8 over the leading bytes mismatches.
+  if (in.crc != crc8((const uint8_t*)&in, offsetof(CtrlPacket, crc))) {
+    crcDrops++;
+    return;
+  }
 
   // Drop stale/duplicate/reordered frames: accept only a newer seq. The int32
   // cast makes the compare wrap-safe at 2^32. A large backward jump (>=1000)
   // means the controller rebooted (seq restarts near 0) — resync rather than
   // lock the link out, since lastSeq would otherwise reject every fresh frame.
   static uint32_t lastSeq = 0;
-  uint32_t incoming;
-  memcpy(&incoming, data, sizeof(incoming));  // seq is the first field
-  int32_t d = (int32_t)(incoming - lastSeq);
+  int32_t d = (int32_t)(in.seq - lastSeq);
   if (d <= 0 && d > -1000) return;
-  lastSeq = incoming;
+  lastSeq = in.seq;
 
   portENTER_CRITICAL(&pktMux);
-  memcpy(&lastPacket, data, sizeof(CtrlPacket));
+  lastPacket   = in;
   lastPacketMs = millis();
   portEXIT_CRITICAL(&pktMux);
 }
@@ -468,11 +477,12 @@ void loop() {
     bool fresh = age < 500 && p.seq != lastSeen;
     int32_t cmd[4];
     mecanumMix(p.vx, p.vy, p.omega, cmd);
-    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f]%s\n",
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s\n",
                   (unsigned long)p.seq, p.vx, p.vy, p.omega,
                   (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
                   lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
                   lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
+                  (unsigned long)crcDrops,
                   fresh ? "" : " (stale)");
     lastSeen = p.seq;
   }

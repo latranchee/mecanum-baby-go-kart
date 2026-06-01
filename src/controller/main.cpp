@@ -268,7 +268,8 @@ void loop() {
   uint8_t flags = 0;
   if ((btnMask & 0x0C) == 0x0C) flags |= 0x01;
 
-  CtrlPacket pkt = { ++seq, vx, vy, omega, btnMask, flags };
+  CtrlPacket pkt = { ++seq, vx, vy, omega, btnMask, flags, 0 };
+  pkt.crc = crc8((const uint8_t*)&pkt, offsetof(CtrlPacket, crc));  // integrity (#4)
   if (peerAdded) esp_now_send(ROBOT_MAC, (uint8_t*)&pkt, sizeof(pkt));
 
   // Display refresh @ ~10Hz: status/speed only on change, sticks every tick.

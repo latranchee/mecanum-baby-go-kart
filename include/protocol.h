@@ -3,13 +3,15 @@
 
 // ESP-NOW packet: controller -> robot
 // Send rate ~50Hz. Robot watchdog stops motors if no packet for 500ms.
+// Robot drops frames whose seq is not newer (dedup) or whose crc8 mismatches.
 struct __attribute__((packed)) CtrlPacket {
-  uint32_t seq;       // monotonic counter (debug + dedup)
+  uint32_t seq;       // monotonic counter; robot accepts only newer seq (dedup)
   int16_t  vx;        // -1000..+1000 (forward+)
   int16_t  vy;        // -1000..+1000 (strafe right+)
   int16_t  omega;     // -1000..+1000 (CCW+)
   uint8_t  buttons;   // bit0=LeftBtn, bit1=RightBtn, bit2=LeftJoyBtn, bit3=RightJoyBtn
   uint8_t  flags;     // bit0=estop
+  uint8_t  crc;       // crc8 over all preceding bytes (control_math.h). MUST be last.
 };
 
 // Robot MAC + ESP-NOW keys live in secrets.h (gitignored). A fresh clone with no
