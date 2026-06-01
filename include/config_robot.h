@@ -22,3 +22,9 @@ static const float CMD_SLEW = 4000.0f;
 
 // Link watchdog: stop motors if no fresh packet for this long.
 static const uint32_t WATCHDOG_MS = 500;
+
+// Battery sensing (#5). No divider wired by default -> disabled (pin -1), so no
+// fabricated voltage is logged. To enable: set BATT_ADC_PIN to the ADC-capable
+// GPIO reading the divider, and BATT_DIVIDER to Vbatt/Vadc (the divider ratio).
+static const int   BATT_ADC_PIN = -1;
+static const float BATT_DIVIDER = 1.0f;

@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>   // esp_reset_reason()
 #include "protocol.h"
 #include "config_robot.h"
 #include "kinematics.h"
@@ -80,6 +81,31 @@ static void motorWrite(uint8_t idx, int16_t speed) {
 
 static void motorStopAll() {
   for (uint8_t i = 0; i < 4; i++) motorWrite(i, 0);
+}
+
+// ---------------- Battery / reset telemetry (#5) ----------------
+// Returns pack voltage in volts, or -1 when no sensing is wired (BATT_ADC_PIN<0)
+// so callers can omit the field rather than print a fabricated value.
+static float readBattVolts() {
+  if (BATT_ADC_PIN < 0) return -1.0f;
+  float vadc = analogReadMilliVolts(BATT_ADC_PIN) / 1000.0f;
+  return vadc * BATT_DIVIDER;
+}
+
+static const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "POWERON";
+    case ESP_RST_EXT:      return "EXT";
+    case ESP_RST_SW:       return "SW";
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:  return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT:      return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";  // supply rail collapsed
+    case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+    case ESP_RST_SDIO:     return "SDIO";
+    default:               return "UNKNOWN";
+  }
 }
 
 // ---------------- Mecanum kinematics ----------------
@@ -309,12 +335,16 @@ static void emitTlm(uint32_t now) {
   int32_t cmd[4];
   mecanumMix(p.vx, p.vy, p.omega, cmd);
 
-  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]\n",
+  char batt[24] = "";
+  float vb = readBattVolts();
+  if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
+
+  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
                 (unsigned long)now,
                 (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
                 lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
                 (float)delta[0]/dt, (float)delta[1]/dt, (float)delta[2]/dt, (float)delta[3]/dt,
-                cnt[0], cnt[1], cnt[2], cnt[3]);
+                cnt[0], cnt[1], cnt[2], cnt[3], batt);
 }
 
 // ---------------- ESP-NOW receive ----------------
@@ -389,6 +419,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\nmecanum robot: ESP-NOW + mecanum kinematics");
+  Serial.printf("reset reason: %s\n", resetReasonStr(esp_reset_reason()));
 
   for (uint8_t i = 0; i < 4; i++) {
     const Motor& m = motors[i];
@@ -477,12 +508,15 @@ void loop() {
     bool fresh = age < 500 && p.seq != lastSeen;
     int32_t cmd[4];
     mecanumMix(p.vx, p.vy, p.omega, cmd);
-    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s\n",
+    char batt[24] = "";
+    float vb = readBattVolts();
+    if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s\n",
                   (unsigned long)p.seq, p.vx, p.vy, p.omega,
                   (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
                   lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
                   lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
-                  (unsigned long)crcDrops,
+                  (unsigned long)crcDrops, batt,
                   fresh ? "" : " (stale)");
     lastSeen = p.seq;
   }
