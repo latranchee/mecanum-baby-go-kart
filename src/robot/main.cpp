@@ -3,6 +3,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "protocol.h"
+#include "config_robot.h"
+#include "kinematics.h"
 
 // ---------------- Motor pin map (see docs/pinout.md) ----------------
 // Wheel layout (top-down view, robot facing forward):
@@ -23,28 +25,25 @@ struct Motor {
 // swapped (so each index drives its true corner) and inA/inB swapped on both
 // rear entries to invert direction (+cmd -> forward). Front pair unchanged.
 // Encoder pin pairs (encA/encB) travel with their motor, so encSign[] is
-// unchanged. NOTE: FR (slot 1) encoder reads 0 (dead wiring on GPIO 16/4) —
-// hardware fix still pending; PID drives FR open-loop via feed-forward.
+// unchanged. FR (slot 1) encoder was dead (loose power cable on the encoder
+// supply) — fixed 2026-05-31, now reads full scale; back on closed loop.
 static const Motor motors[4] = {
   { 18,  5, 19, 13, 17 },  // FL  motor=(18, 5,19)  encoder=(13,17)
-  { 21, 23, 22, 16,  4 },  // FR  motor=(21,23,22)  encoder=(16, 4) [encoder dead - HW]
+  { 21, 23, 22, 16,  4 },  // FR  motor=(21,23,22)  encoder=(16, 4)
   { 25, 27, 33, 39, 36 },  // RL  was old-slot3 hw=(25,33,27); inA<->inB swapped to invert  encoder=(39,36)
   { 26, 32, 14, 35, 34 },  // RR  was old-slot2 hw=(26,14,32); inA<->inB swapped to invert  encoder=(35,34)
 };
 
-static const int PWM_FREQ = 25000;
-static const int PWM_RES  = 10;
-static const int PWM_MAX  = (1 << PWM_RES) - 1;
-static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed PWM directly
+// PWM_FREQ / PWM_RES / PWM_MAX / DEADBAND now in config_robot.h.
 
 static volatile long encCount[4] = { 0, 0, 0, 0 };
 // Derived from solo-PWM test: +PWM raw_tps signs [-, +, -, +] for [FL,FR,RL,RR].
 static const int8_t encSign[4]   = { -1, +1, -1, +1 };
 
-// FR (slot 1) encoder is dead (HW wiring on GPIO 16/4). Run that wheel open-loop:
-// pure feed-forward PWM, no P/I — otherwise the PID sees measured=0, computes a
-// huge error and over-drives FR to saturation. Others stay closed-loop.
-static const bool openLoop[4] = { false, true, false, false };
+// Per-wheel open-loop override: pure feed-forward PWM, no P/I (for a dead
+// encoder). All four encoders work now, so all closed-loop. Kept as a knob:
+// flip an entry true if that encoder fails, so its wheel still drives.
+static const bool openLoop[4] = { false, false, false, false };
 
 static void IRAM_ATTR encISR0() { if (digitalRead(motors[0].encB)) encCount[0]--; else encCount[0]++; }
 static void IRAM_ATTR encISR1() { if (digitalRead(motors[1].encB)) encCount[1]--; else encCount[1]++; }
@@ -83,28 +82,10 @@ static void motorStopAll() {
 }
 
 // ---------------- Mecanum kinematics ----------------
-// Wheel command in [-1000..+1000] (units: thousandths of max wheel speed).
-// X-pattern rollers, slot map: M1=FL, M2=FR, M3=RL, M4=RR.
-static void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t outCmd[4]) {
-  outCmd[0] = (int32_t)vx - vy - omega;  // FL
-  outCmd[1] = (int32_t)vx + vy + omega;  // FR
-  outCmd[2] = (int32_t)vx + vy - omega;  // RL
-  outCmd[3] = (int32_t)vx - vy + omega;  // RR
-
-  int32_t peak = 1000;
-  for (int i = 0; i < 4; i++) if (abs(outCmd[i]) > peak) peak = abs(outCmd[i]);
-  if (peak > 1000) {
-    for (int i = 0; i < 4; i++) outCmd[i] = (outCmd[i] * 1000) / peak;
-  }
-}
+// mecanumMix() now in include/kinematics.h (host-testable, no Arduino deps).
 
 // ---------------- Per-wheel PI velocity control ----------------
-// Measured at ramp test: ~2130 ticks/sec at full PWM (1023). Use as cmd=1000 reference.
-static const float MAX_TPS = 2100.0f;          // max wheel speed (ticks/sec) used to scale cmd
-static const float Kff     = (float)PWM_MAX / MAX_TPS;  // ~0.487 — feed-forward gain
-static const float Kp      = 0.15f;
-static const float Ki      = 0.4f;             // re-enabled with conditional-integration anti-windup
-static const float I_MAX   = 0.6f * (float)PWM_MAX;  // bound integral authority (~614)
+// MAX_TPS / Kff / Kp / Ki / I_MAX now in config_robot.h.
 
 struct PidState {
   float  integral;
@@ -115,8 +96,7 @@ static PidState pid[4] = {};
 // Command slew limiter: ramp each wheel cmd toward its mix target instead of
 // stepping instantly. Four motors slamming 0->full at once draw near-stall
 // current simultaneously (no back-EMF yet) and collapse a weak supply rail —
-// worst during spin-in-place. Ramping staggers the current rise.
-static const float CMD_SLEW = 4000.0f;  // cmd units/sec (full 0..1000 in ~250ms)
+// worst during spin-in-place. Ramping staggers the current rise. (CMD_SLEW in config_robot.h.)
 static int32_t curCmd[4] = { 0, 0, 0, 0 };
 
 // Last PID step values for telemetry (M1 only, to keep log short)
@@ -442,7 +422,7 @@ void loop() {
     age = now - lastPacketMs;
     portEXIT_CRITICAL(&pktMux);
 
-    if (age > 500 || (p.flags & 0x01)) {
+    if (age > WATCHDOG_MS || (p.flags & 0x01)) {
       if (!wasStopped) { motorStopAll(); pidReset(); wasStopped = true; }
     } else if (testMode && testSrc == TS_DIRECT) {
       for (int i = 0; i < 4; i++) {
