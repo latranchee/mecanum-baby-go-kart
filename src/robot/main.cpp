@@ -5,7 +5,9 @@
 #include <esp_system.h>   // esp_reset_reason()
 #include "protocol.h"
 #include "config_robot.h"
-#include "kinematics.h"
+#include "kinematics.h"     // mecanumMix() + forwardKinematics()
+#include "governor.h"       // speedGovernorScale() — cross-wheel sync
+#include "body_loop.h"      // bodyCorrection() — body-space outer loop
 #include "control_math.h"   // crc8()
 
 // ---------------- Motor pin map (see docs/pinout.md) ----------------
@@ -47,10 +49,33 @@ static const int8_t encSign[4]   = { -1, +1, -1, +1 };
 // flip an entry true if that encoder fails, so its wheel still drives.
 static const bool openLoop[4] = { false, false, false, false };
 
-static void IRAM_ATTR encISR0() { if (digitalRead(motors[0].encB)) encCount[0]--; else encCount[0]++; }
-static void IRAM_ATTR encISR1() { if (digitalRead(motors[1].encB)) encCount[1]--; else encCount[1]++; }
-static void IRAM_ATTR encISR2() { if (digitalRead(motors[2].encB)) encCount[2]--; else encCount[2]++; }
-static void IRAM_ATTR encISR3() { if (digitalRead(motors[3].encB)) encCount[3]--; else encCount[3]++; }
+// Full 4x quadrature decode (BUG-008 fixed 2026-06-02). Interrupt on CHANGE of
+// BOTH channels; each A/B edge advances a 2-bit state and a transition lookup
+// adds +1/-1 (or 0 for no-change / illegal double-step). This rejects the phantom
+// counts the old 1x decode streamed when a held wheel dithered encA: a real
+// rotation walks the Gray sequence (net +/-), but dither bounces between two
+// states and nets ~0. Sign convention is preserved (00->10 == +1, the same edge
+// the old code counted +1 on), so encSign[] stays valid — see [[wheel-sync-and-encsign]].
+// Tick magnitude is ~4x the old rate, so MAX_TPS[] must be recalibrated.
+static volatile uint8_t encState[4] = { 0, 0, 0, 0 };  // last (A<<1)|B per wheel
+// Index = (oldState<<2)|newState, state=(A<<1)|B. +1 along the increment Gray
+// cycle 00->10->11->01->00, -1 reverse, 0 for no-move and illegal both-bit jumps.
+static const int8_t QTAB[16] = {
+   0, -1, +1,  0,
+  +1,  0,  0, -1,
+  -1,  0,  0, +1,
+   0, +1, -1,  0,
+};
+static inline void IRAM_ATTR encUpdate(uint8_t i) {
+  uint8_t s   = (uint8_t)((digitalRead(motors[i].encA) << 1) | digitalRead(motors[i].encB));
+  uint8_t idx = (uint8_t)((encState[i] << 2) | s);
+  encCount[i] += QTAB[idx];
+  encState[i]  = s;
+}
+static void IRAM_ATTR encISR0() { encUpdate(0); }
+static void IRAM_ATTR encISR1() { encUpdate(1); }
+static void IRAM_ATTR encISR2() { encUpdate(2); }
+static void IRAM_ATTR encISR3() { encUpdate(3); }
 static void (*encISRs[4])() = { encISR0, encISR1, encISR2, encISR3 };
 
 static bool isInputOnly(uint8_t pin) {
@@ -126,10 +151,22 @@ static PidState pid[4] = {};
 // worst during spin-in-place. Ramping staggers the current rise. (CMD_SLEW in config_robot.h.)
 static int32_t curCmd[4] = { 0, 0, 0, 0 };
 
+// Cross-wheel governor: low-passed group scale applied to all wheel commands.
+static float govScale = 1.0f;
+
+// Body-space outer loop: persistent state + IIR-filtered chassis-twist estimate.
+static BodyLoopState bodyState = { 0, 0, 0, 0, 0, 0 };
+static float bodyVxF = 0, bodyVyF = 0, bodyWF = 0, bodySF = 0;  // filtered vx,vy,omega,slip
+static float lastBodyCorr[3] = { 0, 0, 0 };                     // last (dvx,dvy,dw) for telemetry
+
 // Last PID step values for telemetry (M1 only, to keep log short)
 static float lastTargetTps[4] = { 0, 0, 0, 0 };
 static float lastMeasTps[4]   = { 0, 0, 0, 0 };
 static float lastOutPwm[4]    = { 0, 0, 0, 0 };
+
+// Per-wheel stall detection (telemetry): pinned near max PWM but barely moving.
+static float stallMs[4]      = { 0, 0, 0, 0 };
+static bool  wheelStalled[4] = { false, false, false, false };
 
 static long readCountAtomic(uint8_t i) {
   noInterrupts();
@@ -142,35 +179,73 @@ static void pidReset() {
   for (int i = 0; i < 4; i++) {
     pid[i].integral  = 0.0f;
     pid[i].lastCount = readCountAtomic(i);
-    curCmd[i]        = 0;  // drop the slew ramp so resume starts from rest
+    curCmd[i]        = 0;     // drop the slew ramp so resume starts from rest
+    lastOutPwm[i]    = 0.0f;  // output slew restarts from zero too
+    stallMs[i]       = 0.0f;
+    wheelStalled[i]  = false;
   }
+  govScale = 1.0f;            // resume ungoverned, ramp in again from measurement
+  // Body-space outer loop: drop integrals, filtered estimate, and correction so
+  // resume starts from a clean chassis state (no stale heading bias).
+  bodyState.ix = bodyState.iy = bodyState.iw = 0.0f;
+  bodyState.dvx = bodyState.dvy = bodyState.dw = 0.0f;
+  bodyVxF = bodyVyF = bodyWF = bodySF = 0.0f;
+  lastBodyCorr[0] = lastBodyCorr[1] = lastBodyCorr[2] = 0.0f;
 }
 
 // cmd[i] in [-1000..+1000]; dt in seconds.
 static void pidStep(const int32_t cmd[4], float dt) {
   for (int i = 0; i < 4; i++) {
     // Signed encoder delta (apply sign to fix wiring inversions).
-    long now = readCountAtomic(i);
-    float measuredTps = encSign[i] * (now - pid[i].lastCount) / dt;
-    pid[i].lastCount  = now;
+    long now   = readCountAtomic(i);
+    long delta = now - pid[i].lastCount;
+    pid[i].lastCount = now;
 
-    float targetTps = ((float)cmd[i] / 1000.0f) * MAX_TPS;
+    // Glitch rejection: a real wheel can't exceed ~MAX_TPS, so a larger
+    // per-tick delta is electrical noise from motor current transients. Clamp
+    // it so the loop tracks real motion, not the spike. Without this, inrush
+    // noise spikes the velocity estimate, the PID slams PWM to react, and the
+    // current swing makes more noise — a self-sustaining limit cycle (worst on
+    // vx+, all 4 motors inrushing forward together).
+    long maxDelta = (long)(MAX_TPS[i] * 1.5f * dt) + 2;
+    if (delta >  maxDelta) delta =  maxDelta;
+    if (delta < -maxDelta) delta = -maxDelta;
+    float measuredTps = encSign[i] * (float)delta / dt;
+
+    // Feed-forward is per-wheel (a weak-battery wheel needs more PWM per tick/sec),
+    // but the TARGET is a UNIFORM absolute speed capped at the weakest wheel
+    // (refTps = maxTpsMin) so cmd 1000 means the same ground speed on every wheel
+    // and the cart drives straight. A strong wheel simply uses less of its range.
+    const float refTps    = maxTpsMin();
+    const float kff       = (float)PWM_MAX / MAX_TPS[i];  // per-wheel feed-forward
+    float targetTps = ((float)cmd[i] / 1000.0f) * refTps;
 
     if (cmd[i] == 0) {
+      // Commanded idle: ramp PWM down to 0 respecting PWM_SLEW instead of slamming
+      // (a wheel pinned at PWM_MAX dropping to 0 in one tick defeats the anti-slam
+      // intent and shocks the supply). The estop/watchdog path calls motorStopAll()
+      // directly for an immediate hard stop, so safety stops are unaffected.
       pid[i].integral = 0.0f;
-      motorWrite(i, 0);
+      float prevOut    = lastOutPwm[i];
+      float maxPwmStep = PWM_SLEW * dt;
+      float out        = 0.0f;
+      if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
+      if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+      motorWrite(i, (int16_t)lroundf(out));
+      stallMs[i]       = 0.0f;
+      wheelStalled[i]  = false;
       lastTargetTps[i] = 0;
       lastMeasTps[i]   = measuredTps;
-      lastOutPwm[i]    = 0;
+      lastOutPwm[i]    = out;
       continue;
     }
 
     // Dead-encoder wheels: open-loop feed-forward only. No error term (measured
     // is meaningless), so PWM tracks the commanded speed directly.
     if (openLoop[i]) {
-      float out = Kff * targetTps;
+      float out = kff * targetTps;
       out = constrain(out, -(float)PWM_MAX, (float)PWM_MAX);
-      motorWrite(i, (int16_t)out);
+      motorWrite(i, (int16_t)lroundf(out));
       pid[i].integral  = 0.0f;
       pid[i].lastCount = now;
       lastTargetTps[i] = targetTps;
@@ -181,23 +256,47 @@ static void pidStep(const int32_t cmd[4], float dt) {
 
     float err = targetTps - measuredTps;
 
-    // Conditional-integration anti-windup: only accumulate when the output is
-    // not already saturated in the direction the error would push it. Stops
-    // the integral from running away while PWM is pinned (the old failure).
-    float pre = Kff * targetTps + Kp * err + pid[i].integral;
-    bool saturated = (pre >=  PWM_MAX && err > 0) ||
-                     (pre <= -PWM_MAX && err < 0);
-    if (!saturated) {
+    // Compute the desired output from the CURRENT integral, then apply BOTH
+    // actuator limits — the hard PWM_MAX clamp and the per-tick slew limiter —
+    // to get the value actually delivered this tick.
+    float prevOut    = lastOutPwm[i];
+    float maxPwmStep = PWM_SLEW * dt;
+    float desired    = kff * targetTps + Kp * err + pid[i].integral;
+
+    float out = desired;
+    if (out >  PWM_MAX) out =  PWM_MAX;
+    if (out < -PWM_MAX) out = -PWM_MAX;
+    // Output slew-rate limit: cap per-tick PWM change so the loop can't slam
+    // the motor rail-to-rail (kills the rotate-start oscillation).
+    if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
+    if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+
+    // Conditional-integration anti-windup: integrate only when the actuator is
+    // NOT limited in the direction the error would push it. This now covers the
+    // slew limiter too, not just the ±PWM_MAX clamp — the old test missed the
+    // case where the integral kept winding while the output was slew-pinned far
+    // below PWM_MAX, then overshot once the ramp released.
+    bool limited = (out < desired - 0.001f && err > 0) ||
+                   (out > desired + 0.001f && err < 0);
+    if (!limited) {
       pid[i].integral += err * dt * Ki;
       if (pid[i].integral >  I_MAX) pid[i].integral =  I_MAX;
       if (pid[i].integral < -I_MAX) pid[i].integral = -I_MAX;
     }
 
-    float out = Kff * targetTps + Kp * err + pid[i].integral;
-    if (out >  PWM_MAX) out =  PWM_MAX;
-    if (out < -PWM_MAX) out = -PWM_MAX;
+    // Stall flag (telemetry): pinned near max PWM yet barely moving = held/jammed
+    // or the supply rail collapsed. Surfaces WHICH wheel for the operator; the
+    // governor already trims command to keep stall current down.
+    float aout  = out < 0 ? -out : out;
+    float ameas = measuredTps < 0 ? -measuredTps : measuredTps;
+    if (aout >= STALL_PWM_FRAC * PWM_MAX && ameas < STALL_TPS_FRAC * MAX_TPS[i]) {
+      stallMs[i] += dt * 1000.0f;
+    } else {
+      stallMs[i] = 0.0f;
+    }
+    wheelStalled[i] = stallMs[i] >= STALL_MS;
 
-    motorWrite(i, (int16_t)out);
+    motorWrite(i, (int16_t)lroundf(out));
     lastTargetTps[i] = targetTps;
     lastMeasTps[i]   = measuredTps;
     lastOutPwm[i]    = out;
@@ -277,7 +376,10 @@ static void handleCommand(char* line) {
       for (int i = 0; i < 4; i++) encCount[i] = 0;
       interrupts();
       pidReset();
-      for (int i = 0; i < 4; i++) prevEnc[i] = 0;
+      // Baseline telemetry from the post-zero counts (not a hard 0) so the first
+      // TLM delta after `r` doesn't show a phantom velocity from ISR ticks that
+      // landed between the zeroing and pidReset.
+      for (int i = 0; i < 4; i++) prevEnc[i] = readCountAtomic(i);
       Serial.println("OK r");
       break;
     case 'x':
@@ -319,8 +421,10 @@ static void pollSerial() {
 }
 
 static void emitTlm(uint32_t now) {
+  // Skip a same-millisecond re-entry: dividing by a 1 ms floor inflates raw_tps
+  // ~50x and shows a phantom spike on the readout used to diagnose stalls.
+  if (prevTlmMs != 0 && now == prevTlmMs) return;
   uint32_t dt_ms = (prevTlmMs == 0) ? 50 : (now - prevTlmMs);
-  if (dt_ms == 0) dt_ms = 1;
   float dt = dt_ms / 1000.0f;
   long cnt[4], delta[4];
   for (int i = 0; i < 4; i++) {
@@ -339,9 +443,12 @@ static void emitTlm(uint32_t now) {
   float vb = readBattVolts();
   if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
 
-  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
+  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] gov=%.2f body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
                 (unsigned long)now,
                 (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
+                govScale,
+                bodyVxF, bodyVyF, bodyWF, bodySF,
+                lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
                 lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
                 (float)delta[0]/dt, (float)delta[1]/dt, (float)delta[2]/dt, (float)delta[3]/dt,
                 cnt[0], cnt[1], cnt[2], cnt[3], batt);
@@ -447,7 +554,12 @@ void setup() {
     ledcWrite(m.pwm, 0);
     pinMode(m.encA, isInputOnly(m.encA) ? INPUT : INPUT_PULLUP);
     pinMode(m.encB, isInputOnly(m.encB) ? INPUT : INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(m.encA), encISRs[i], RISING);
+    // 4x quadrature: seed the state from the rest level, then fire on every edge
+    // of BOTH channels. Both pins share one ISR per wheel; same-core GPIO ISRs
+    // serialize, so encState[i] needs no extra guard.
+    encState[i] = (uint8_t)((digitalRead(m.encA) << 1) | digitalRead(m.encB));
+    attachInterrupt(digitalPinToInterrupt(m.encA), encISRs[i], CHANGE);
+    attachInterrupt(digitalPinToInterrupt(m.encB), encISRs[i], CHANGE);
   }
 
   setupEspNow();
@@ -498,9 +610,20 @@ void loop() {
       pidReset();
       wasStopped = false;
     } else {
+      // Resuming from a stopped state (watchdog/estop release): the wheels may
+      // have been nudged by hand while pidStep was skipped, so pid[].lastCount is
+      // stale. Re-baseline it to the current count so the first velocity estimate
+      // spans one tick, not the whole stopped interval (no recovery lurch).
+      if (wasStopped) {
+        for (int i = 0; i < 4; i++) pid[i].lastCount = readCountAtomic(i);
+        govScale = 1.0f;
+      }
+
+      // Base twist -> wheel targets. Slew-limit toward target to cap simultaneous
+      // inrush current. The body-loop correction below deliberately BYPASSES this
+      // slew (it is near-zero net current and must stay responsive).
       int32_t cmd[4];
       mecanumMix(p.vx, p.vy, p.omega, cmd);
-      // Slew-limit toward target to cap simultaneous inrush current.
       int32_t maxStep = (int32_t)(CMD_SLEW * dt);
       if (maxStep < 1) maxStep = 1;
       for (int i = 0; i < 4; i++) {
@@ -509,7 +632,82 @@ void loop() {
         if (d < -maxStep) d = -maxStep;
         curCmd[i] += d;
       }
-      pidStep(curCmd, dt);
+
+      // Cross-wheel governor: scale every wheel by the worst-tracking one so the
+      // group slows to match a held/stalled/supply-limited wheel instead of
+      // yawing about it. Uses last tick's measured speeds; low-passed via GOV_SLEW
+      // so a transient accel lag can't collapse drive. govScale eases back to 1.0
+      // as the lagging wheel recovers. Judged on the BASE twist (curCmd).
+      int32_t driveCmd[4];
+#if SYNC_GOVERNOR
+      bool valid[4] = { !openLoop[0], !openLoop[1], !openLoop[2], !openLoop[3] };
+      // Judge wheels by magnitude + output saturation (sign-independent), so a
+      // held wheel is caught identically in forward and reverse. Uses last tick's
+      // measured speeds and PWM.
+      float gTarget = speedGovernorScale(curCmd, lastMeasTps, lastOutPwm,
+                                         maxTpsMin(), (float)PWM_MAX,
+                                         GOV_FLOOR, GOV_SAT_FRAC, valid);  // uniform ref
+      // Spin-in-place scrubs all wheels equally below the no-load refTps, which the
+      // governor would read as universal failure and throttle to a crawl. Symmetric
+      // load is not the held-corner case it exists for, so fade the throttle by how
+      // rotational the command is: pure spin -> governor off, translation unchanged.
+      gTarget = governorRotationRelax(gTarget, p.vx, p.vy, p.omega, GOV_SPIN_RELAX);
+      // Asymmetric slew: fall fast (catch a block), rise slow (smooth resume).
+      float gDown = GOV_SLEW_DOWN * dt;
+      float gUp   = GOV_SLEW_UP   * dt;
+      if      (gTarget < govScale - gDown) govScale -= gDown;
+      else if (gTarget > govScale + gUp)   govScale += gUp;
+      else                                  govScale  = gTarget;
+#else
+      govScale = 1.0f;
+#endif
+      for (int i = 0; i < 4; i++) driveCmd[i] = (int32_t)lroundf(curCmd[i] * govScale);
+
+      // Body-space outer loop: estimate the chassis twist from the wheels and add
+      // a small heading/centre correction the per-wheel loops structurally cannot
+      // (a SISO wheel loop can't tell "one wheel lagging" from "the chassis
+      // yawing"). The correction is an additive wheel-space twist added AFTER the
+      // governor scale, so its yaw authority survives while the governor throttles
+      // base magnitude. See body_loop.h.
+#if BODY_LOOP
+      {
+        const float refTps = maxTpsMin();
+        float vx_m, vy_m, w_m, s_m;
+        forwardKinematics(lastMeasTps, refTps, &vx_m, &vy_m, &w_m, &s_m);
+        // Single-pole IIR on the body estimate (heavier on noisy omega/vy).
+        bodyVxF += BODY_IIR_ALPHA_TRANS * (vx_m - bodyVxF);
+        bodyVyF += BODY_IIR_ALPHA_W     * (vy_m - bodyVyF);
+        bodyWF  += BODY_IIR_ALPHA_W     * (w_m  - bodyWF);
+        bodySF  += BODY_IIR_ALPHA_W     * (s_m  - bodySF);
+
+        // Handoff gating: freeze the outer integral whenever the governor owns the
+        // situation — a saturated wheel, an active throttle, or high slip — so the
+        // two loops never fight for magnitude authority.
+        bool anySat = false;
+        for (int i = 0; i < 4; i++) {
+          float a = lastOutPwm[i] < 0 ? -lastOutPwm[i] : lastOutPwm[i];
+          if (a >= GOV_SAT_FRAC * PWM_MAX) { anySat = true; break; }
+        }
+        float aS = bodySF < 0 ? -bodySF : bodySF;
+        bool freezeI = anySat || govScale < BODY_GOV_FREEZE || aS > BODY_SLIP_GATE;
+
+        BodyLoopCfg bc = { BODY_KP_TRANS, BODY_KP_W, BODY_KI_TRANS, BODY_KI_W,
+                           BODY_I_MAX, BODY_W_THRESH, BODY_RATE, BODY_CORR_MAX };
+        float dvx, dvy, dw;
+        bodyCorrection((float)p.vx, (float)p.vy, (float)p.omega,
+                       bodyVxF, bodyVyF, bodyWF, freezeI, govScale, dt,
+                       &bc, &bodyState, &dvx, &dvy, &dw);
+        lastBodyCorr[0] = dvx; lastBodyCorr[1] = dvy; lastBodyCorr[2] = dw;
+
+        // Additive correction twist -> wheel deltas, added AFTER governor scaling.
+        int32_t corr[4];
+        mecanumMix((int16_t)lroundf(dvx), (int16_t)lroundf(dvy),
+                   (int16_t)lroundf(dw), corr);
+        for (int i = 0; i < 4; i++) driveCmd[i] += corr[i];
+      }
+#endif
+
+      pidStep(driveCmd, dt);
       wasStopped = false;
     }
   }
@@ -536,12 +734,19 @@ void loop() {
     char batt[24] = "";
     float vb = readBattVolts();
     if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
-    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s\n",
+    char stall[20] = "";
+    if (wheelStalled[0] || wheelStalled[1] || wheelStalled[2] || wheelStalled[3])
+      snprintf(stall, sizeof(stall), " STALL=[%d %d %d %d]",
+               wheelStalled[0], wheelStalled[1], wheelStalled[2], wheelStalled[3]);
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] gov=%.2f body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s%s\n",
                   (unsigned long)p.seq, p.vx, p.vy, p.omega,
                   (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
+                  govScale,
+                  bodyVxF, bodyVyF, bodyWF, bodySF,
+                  lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
                   lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
                   lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
-                  (unsigned long)crcDrops, batt,
+                  (unsigned long)crcDrops, batt, stall,
                   fresh ? "" : " (stale)");
     lastSeen = p.seq;
   }

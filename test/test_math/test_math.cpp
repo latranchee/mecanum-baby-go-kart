@@ -2,8 +2,10 @@
 // These lock the sign/remap/scaling math that has repeatedly needed fixing.
 #include <unity.h>
 #include <string.h>
-#include "kinematics.h"
+#include "kinematics.h"          // mecanumMix + forwardKinematics
 #include "control_math.h"
+#include "governor.h"           // speedGovernorScale (cross-wheel sync)
+#include "body_loop.h"          // bodyCorrection (body-space outer loop)
 #include "protocol.h"            // CtrlPacket wire format
 #include "config_controller.h"  // CURVE, DEADZONE_RAW, HALF_RANGE
 
@@ -47,6 +49,326 @@ static void test_mix_saturation_caps_at_1000(void) {
   }
   TEST_ASSERT_EQUAL_INT32(1000, c[1]);   // peak wheel pinned to +1000
   TEST_ASSERT_EQUAL_INT32(-333, c[0]);   // -1000 * 1000 / 3000
+}
+
+// ---------------- speedGovernorScale (cross-wheel sync) ----------------
+// Signature: (cmd, meas, outPwm, refTps, pwmMax, loScale, satFrac, valid).
+// refTps = uniform target reference (weakest wheel's max). 2100 here. pwmMax=1023.
+// loScale=0.1, satFrac=0.90 (=> saturation threshold 920.7) unless noted. ONLY a
+// saturated wheel can drag the group, so satFrac is also the engage gate.
+#define GMAX 2100.0f
+#define GPWM 1023.0f
+#define GLO  0.10f
+#define GSAT 0.90f
+
+static void test_gov_all_tracking_no_scale(void) {
+  // Every wheel at full command, full speed, out pinned (1023) but ratio 1.0 -> 1.0.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   meas[4] = { 2100, 2100, 2100, 2100 };
+  float   out[4]  = { 1023, 1023, 1023, 1023 };
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_held_wheel_pulls_group_to_floor(void) {
+  // RL (slot 2) held -> measures 0, out pinned at max -> group collapses to floor.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   meas[4] = { 2100, 2100,    0, 2100 };
+  float   out[4]  = { 1023, 1023, 1023, 1023 };
+  TEST_ASSERT_EQUAL_FLOAT(0.1f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_forward_reverse_symmetric_held_wheel(void) {
+  // THE REGRESSION: a held wheel must collapse the group in BOTH forward and
+  // reverse. The old signed-ratio judge engaged only in reverse (forward phantom
+  // read as "keeping up" -> stayed 1.0 -> the free wheel ran away). With a
+  // magnitude judge the held wheel's small phantom speed governs the group hard
+  // either way. The two need not be bit-identical (wrong-way detection differs by
+  // sign), only that BOTH strongly engage near the floor.
+  int32_t fwd[4]   = {  1000,  1000,  1000,  1000 };
+  int32_t rev[4]   = { -1000, -1000, -1000, -1000 };
+  // FL (slot 0) held: phantom reads the SAME small positive speed regardless of
+  // command (sign set by encB rest level), out pinned at max.
+  float   measF[4] = {  300,  2100,  2100,  2100 };
+  float   measR[4] = {  300, -2100, -2100, -2100 };
+  float   out[4]   = { 1023, 1023, 1023, 1023 };
+  float gF = speedGovernorScale(fwd, measF, out, GMAX, GPWM, GLO, GSAT, 0);
+  float gR = speedGovernorScale(rev, measR, out, GMAX, GPWM, GLO, GSAT, 0);
+  TEST_ASSERT_TRUE(gF <= 0.2f);   // forward now engages (was 1.0 = the bug)
+  TEST_ASSERT_TRUE(gR <= 0.2f);   // reverse still engages
+}
+
+static void test_gov_saturated_phantom_still_engages(void) {
+  // Saturated wheel (out pinned at max) reaching only ratio 0.7: it physically
+  // can't deliver more, so the group slows to 0.7 — saturation is what makes a
+  // wheel a limiter.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   meas[4] = { 1470, 2100, 2100, 2100 };   // 1470/2100 = 0.7
+  float   out[4]  = { 1023, 1023, 1023, 1023 };   // FL pinned at max
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.7f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_mild_lag_unsaturated_ignored(void) {
+  // Ratio 0.8 but NOT saturated (out 818 < 920): has headroom (or is throttled),
+  // so it never limits the group regardless of ratio. The anti-latch rule.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   meas[4] = { 2100, 2100, 1680, 2100 };   // 0.8
+  float   out[4]  = { 1023, 1023,  818, 1023 };
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_zero_command_no_demand(void) {
+  int32_t cmd[4]  = { 0, 0, 0, 0 };
+  float   meas[4] = { 0, 0, 0, 0 };
+  float   out[4]  = { 0, 0, 0, 0 };
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_invalid_wheel_skipped(void) {
+  // Open-loop wheel (slot 1) measures 0 but is excluded -> not governed.
+  int32_t cmd[4]   = { 1000, 1000, 1000, 1000 };
+  float   meas[4]  = { 2100,    0, 2100, 2100 };
+  float   out[4]   = { 1023, 1023, 1023, 1023 };
+  bool    valid[4] = { true, false, true, true };
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, valid));
+}
+
+static void test_gov_uniform_ref_strong_half_not_dragged(void) {
+  // Two battery halves: weak (FL,FR) max ~1600, strong (RL,RR) max ~2100. With the
+  // UNIFORM target reference = weakest max (1600), cmd 1000 targets 1600 for ALL.
+  // Weak wheels hit 1600 (their ceiling, saturated but ratio 1.0); strong wheels
+  // hit 1600 easily at LOW pwm (not saturated). Nothing should drag the group:
+  // the cart is already straight at the achievable common speed. This is the case
+  // a per-wheel-max judge would get wrong (it would call everyone 1.0 too, but for
+  // the wrong reason and would miss a strong wheel that later sags below 1600).
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   ref     = 1600.0f;
+  float   meas[4] = { 1600, 1600, 1600, 1600 };   // all at the common target
+  float   out[4]  = { 1010, 1010,  780,  780 };   // weak near max, strong relaxed
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, ref, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_uniform_ref_sagging_wheel_drags(void) {
+  // Same uniform ref 1600, but a weak wheel now SAGS to 1200 (0.75) and is pinned
+  // at max PWM -> it defines the achievable group speed -> group scales to 0.75.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   ref     = 1600.0f;
+  float   meas[4] = { 1200, 1600, 1600, 1600 };   // FL sags: 1200/1600 = 0.75
+  float   out[4]  = { 1023,  780,  780,  780 };   // FL pinned at max
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.75f, speedGovernorScale(cmd, meas, out, ref, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_throttled_wheel_does_not_latch(void) {
+  // LATCH REGRESSION: the governor's scale is fed back to the commands, so when it
+  // is already throttling, every wheel measures low (meas ~ scale*target) at LOW
+  // pwm. The old rule judged these low-ratio wheels and stayed floored forever
+  // (forward drive stuck at 10%). Now: all unsaturated -> none drag -> scale 1.0,
+  // so the next tick raises drive and the loop climbs back out. Must be 1.0.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   ref     = 2100.0f;
+  float   meas[4] = { 210, 210, 210, 210 };   // all at ~0.1 (throttled), ratio 0.1
+  float   out[4]  = { 102, 102, 102, 102 };   // LOW pwm — not saturated
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, ref, GPWM, GLO, GSAT, 0));
+}
+
+static void test_gov_wrong_way_wheel_floors(void) {
+  // A wheel turning OPPOSITE its command -> ratio forced 0 -> floor.
+  int32_t cmd[4]  = { 1000, 1000, 1000, 1000 };
+  float   meas[4] = { 2100, 2100, -500, 2100 };
+  float   out[4]  = { 1023, 1023, 1023, 1023 };
+  TEST_ASSERT_EQUAL_FLOAT(0.1f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
+// ---------------- governorRotationRelax (spin relax) ----------------
+// Fade throttle depth by rotation fraction. relax=1 unless noted.
+static void test_gov_relax_pure_spin_disables(void) {
+  // Pure spin (vx=vy=0): a hard 0.1 throttle fully relaxes back to 1.0 so the
+  // spin is not crawled by symmetric scrub load.
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, governorRotationRelax(0.1f, 0, 0, 1000, 1.0f));
+}
+
+static void test_gov_relax_pure_translate_unchanged(void) {
+  // Pure translation (omega=0): governor keeps full authority, scale untouched.
+  TEST_ASSERT_EQUAL_FLOAT(0.1f, governorRotationRelax(0.1f, 1000, 0, 0, 1.0f));
+  TEST_ASSERT_EQUAL_FLOAT(0.4f, governorRotationRelax(0.4f, 0, 1000, 0, 1.0f));
+}
+
+static void test_gov_relax_diagonal_partial(void) {
+  // Equal translate + rotate (spin fraction 0.5): throttle depth halved.
+  // gScale 0.5 -> keep=1-1*0.5=0.5 -> 1-(1-0.5)*0.5 = 0.75.
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.75f,
+                           governorRotationRelax(0.5f, 1000, 0, 1000, 1.0f));
+}
+
+static void test_gov_relax_disabled_passthrough(void) {
+  // relax=0 -> feature off, scale passes through even on pure spin.
+  TEST_ASSERT_EQUAL_FLOAT(0.1f, governorRotationRelax(0.1f, 0, 0, 1000, 0.0f));
+}
+
+static void test_gov_relax_idle_no_command(void) {
+  // No command at all -> nothing to relax, scale returned as-is.
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, governorRotationRelax(1.0f, 0, 0, 0, 1.0f));
+}
+
+// ---------------- forwardKinematics (body-space estimate) ----------------
+// Inverse of mecanumMix's linear core. Round-trip through the actual mix so the
+// forward transform stays self-consistent with it even if a sign is later flipped.
+#define FREF 2100.0f
+
+static void fwd_roundtrip(int16_t vx_in, int16_t vy_in, int16_t w_in,
+                          float* vx, float* vy, float* w, float* s) {
+  int32_t c[4];
+  mecanumMix(vx_in, vy_in, w_in, c);
+  float meas[4];
+  for (int i = 0; i < 4; i++) meas[i] = (float)c[i] / 1000.0f * FREF;  // perfect tracking
+  forwardKinematics(meas, FREF, vx, vy, w, s);
+}
+
+static void test_fwd_pure_forward(void) {
+  float vx, vy, w, s;
+  fwd_roundtrip(1000, 0, 0, &vx, &vy, &w, &s);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, vx);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vy);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, w);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, s);   // a commanded twist has zero slip
+}
+
+static void test_fwd_pure_strafe(void) {
+  float vx, vy, w, s;
+  fwd_roundtrip(0, 1000, 0, &vx, &vy, &w, &s);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vx);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, vy);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, w);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, s);
+}
+
+static void test_fwd_pure_rotate(void) {
+  float vx, vy, w, s;
+  fwd_roundtrip(0, 0, 1000, &vx, &vy, &w, &s);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vx);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vy);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, w);
+  // KEY: a normal rotation must report ZERO slip. The wrong null vector
+  // [+1,-1,+1,-1] would read s=-1000 here and false-flag every spin.
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, s);
+}
+
+static void test_fwd_null_mode_is_slip(void) {
+  // Hand-crafted null pattern [-1,-1,+1,+1] (front pair vs rear pair): no chassis
+  // motion, pure slip. vx=vy=omega=0, s=full.
+  float meas[4] = { -FREF, -FREF, FREF, FREF };
+  float vx, vy, w, s;
+  forwardKinematics(meas, FREF, &vx, &vy, &w, &s);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vx);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, vy);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f,    0.0f, w);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, s);
+}
+
+static void test_fwd_uniform_ref_weak_wheel_reports_low(void) {
+  // All four commanded forward but FL only reaches 0.8*ref -> recovered vx < 1000
+  // (the curve a per-wheel-max normalization would hide). vy/omega pick up the
+  // asymmetry; only the magnitude-below-1000 fact is locked here.
+  float meas[4] = { 0.8f * FREF, FREF, FREF, FREF };
+  float vx, vy, w, s;
+  forwardKinematics(meas, FREF, &vx, &vy, &w, &s);
+  TEST_ASSERT_TRUE(vx < 1000.0f);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 950.0f, vx);  // (0.8+1+1+1)/4 * 1000
+}
+
+// ---------------- bodyCorrection (body-space outer loop) ----------------
+static BodyLoopCfg body_cfg(void) {
+  BodyLoopCfg c = { 0.15f, 0.28f, 0.10f, 0.15f, 150.0f, 150.0f, 400.0f, 200.0f };
+  return c;  // kpTrans,kpW,kiTrans,kiW,iMax,wThresh,rateLimit,corrMax
+}
+static BodyLoopCfg body_cfg_ponly(void) {
+  BodyLoopCfg c = body_cfg();
+  c.kiTrans = 0.0f; c.kiW = 0.0f;
+  return c;
+}
+
+// Drive the loop to steady state (rate limit + integral settle) at fixed inputs.
+static void body_settle(BodyLoopState* st, const BodyLoopCfg* c,
+                        float vxc, float vyc, float wc,
+                        float vxm, float vym, float wm,
+                        bool freeze, float gov,
+                        float* dvx, float* dvy, float* dw) {
+  for (int k = 0; k < 400; k++)
+    bodyCorrection(vxc, vyc, wc, vxm, vym, wm, freeze, gov, 0.01f, c, st, dvx, dvy, dw);
+}
+
+static void test_body_zero_error_zero_corr(void) {
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg();
+  float dvx, dvy, dw;
+  body_settle(&st, &c, 300, 0, 0, 300, 0, 0, false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dvx);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dvy);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dw);
+}
+
+static void test_body_yaw_during_translation(void) {
+  // Translating (omega_cmd=0 < thresh) with an unwanted +100 measured yaw ->
+  // opposing (negative) yaw correction, ~zero translation correction.
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg_ponly();
+  float dvx, dvy, dw;
+  body_settle(&st, &c, 500, 0, 0, 500, 0, 100, false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_TRUE(dw < -1.0f);                         // resists the yaw
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dvx);          // translation weight ~0
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dvy);
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, -28.0f, dw);           // kpW * eW = 0.28 * -100
+}
+
+static void test_body_trans_during_rotation(void) {
+  // Rotating (omega_cmd=500 > thresh) with unwanted +80 vx drift -> opposing vx
+  // correction, ~zero yaw correction (yaw weight goes to 0 while rotating).
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg_ponly();
+  float dvx, dvy, dw;
+  body_settle(&st, &c, 0, 0, 500, 80, 0, 500, false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_TRUE(dvx < -1.0f);                        // resists the drift
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, dw);           // yaw weight ~0
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, -12.0f, dvx);          // kpTrans * eVx = 0.15 * -80
+}
+
+static void test_body_saturation_freezes_integral(void) {
+  // With freeze=true the integral never accumulates regardless of standing error.
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg();
+  float dvx, dvy, dw;
+  body_settle(&st, &c, 500, 0, 0, 500, 0, 100, true, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, st.iw);
+  // Sanity: WITHOUT freeze the same error DOES wind the integral.
+  BodyLoopState st2 = {};
+  body_settle(&st2, &c, 500, 0, 0, 500, 0, 100, false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_TRUE(st2.iw < -0.5f);
+}
+
+static void test_body_governor_scales_trans_keeps_yaw(void) {
+  // Translation correction fades with govScale; yaw correction does not.
+  BodyLoopState a = {}, b = {};
+  BodyLoopCfg c = body_cfg_ponly();
+  float dvx_full, dvy, dw, dvx_half;
+  // Rotating + vx drift: compare govScale 1.0 vs 0.5 -> trans correction halves.
+  body_settle(&a, &c, 0, 0, 500, 80, 0, 500, false, 1.0f, &dvx_full, &dvy, &dw);
+  body_settle(&b, &c, 0, 0, 500, 80, 0, 500, false, 0.5f, &dvx_half, &dvy, &dw);
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, 0.5f * dvx_full, dvx_half);
+  // Translating + yaw error: govScale must NOT change the yaw correction.
+  BodyLoopState y1 = {}, y2 = {};
+  float dwf, dwh, jx, jy;
+  body_settle(&y1, &c, 500, 0, 0, 500, 0, 100, false, 1.0f, &jx, &jy, &dwf);
+  body_settle(&y2, &c, 500, 0, 0, 500, 0, 100, false, 0.5f, &jx, &jy, &dwh);
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, dwf, dwh);
+}
+
+static void test_body_correction_rate_limited(void) {
+  // One tick from rest with a huge error: output bounded by rateLimit*dt.
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg();
+  float dvx, dvy, dw;
+  bodyCorrection(0, 0, 0, 0, 0, 5000, false, 1.0f, 0.01f, &c, &st, &dvx, &dvy, &dw);
+  float adw = dw < 0 ? -dw : dw;
+  TEST_ASSERT_TRUE(adw <= c.rateLimit * 0.01f + 0.001f);   // <= 4 cmd units
 }
 
 // ---------------- applyCurve ----------------
@@ -125,6 +447,33 @@ int main(void) {
   RUN_TEST(test_mix_strafe_diagonal_opposite);
   RUN_TEST(test_mix_spin_left_right_opposite);
   RUN_TEST(test_mix_saturation_caps_at_1000);
+  RUN_TEST(test_gov_all_tracking_no_scale);
+  RUN_TEST(test_gov_held_wheel_pulls_group_to_floor);
+  RUN_TEST(test_gov_forward_reverse_symmetric_held_wheel);
+  RUN_TEST(test_gov_saturated_phantom_still_engages);
+  RUN_TEST(test_gov_mild_lag_unsaturated_ignored);
+  RUN_TEST(test_gov_zero_command_no_demand);
+  RUN_TEST(test_gov_invalid_wheel_skipped);
+  RUN_TEST(test_gov_uniform_ref_strong_half_not_dragged);
+  RUN_TEST(test_gov_uniform_ref_sagging_wheel_drags);
+  RUN_TEST(test_gov_throttled_wheel_does_not_latch);
+  RUN_TEST(test_gov_wrong_way_wheel_floors);
+  RUN_TEST(test_gov_relax_pure_spin_disables);
+  RUN_TEST(test_gov_relax_pure_translate_unchanged);
+  RUN_TEST(test_gov_relax_diagonal_partial);
+  RUN_TEST(test_gov_relax_disabled_passthrough);
+  RUN_TEST(test_gov_relax_idle_no_command);
+  RUN_TEST(test_fwd_pure_forward);
+  RUN_TEST(test_fwd_pure_strafe);
+  RUN_TEST(test_fwd_pure_rotate);
+  RUN_TEST(test_fwd_null_mode_is_slip);
+  RUN_TEST(test_fwd_uniform_ref_weak_wheel_reports_low);
+  RUN_TEST(test_body_zero_error_zero_corr);
+  RUN_TEST(test_body_yaw_during_translation);
+  RUN_TEST(test_body_trans_during_rotation);
+  RUN_TEST(test_body_saturation_freezes_integral);
+  RUN_TEST(test_body_governor_scales_trans_keeps_yaw);
+  RUN_TEST(test_body_correction_rate_limited);
   RUN_TEST(test_curve_zero_and_deadzone);
   RUN_TEST(test_curve_sign_preserved);
   RUN_TEST(test_curve_monotonic);
