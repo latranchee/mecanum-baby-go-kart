@@ -352,6 +352,7 @@ static volatile uint32_t lastPacketMs = 0;
 static CtrlPacket lastPacket = { 0, 0, 0, 0, 0, 0, 0 };
 static portMUX_TYPE pktMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t crcDrops = 0;  // count of frames rejected on bad CRC
+static bool espNowReady = false;        // false until radio init + recv cb succeed
 
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len != sizeof(CtrlPacket)) return;
@@ -425,6 +426,7 @@ static void setupEspNow() {
 #endif
 
   esp_now_register_recv_cb(onRecv);
+  espNowReady = true;
   Serial.println("ESP-NOW listening");
 }
 
@@ -460,6 +462,15 @@ static bool     wasStopped  = true;
 void loop() {
   uint32_t now = millis();
   pollSerial();
+
+  // Surface a dead radio. The one-shot setup line scrolls away and the robot is
+  // headless, so re-warn periodically — visible whenever serial is attached.
+  // Motors stay safe meanwhile: no packets arrive, so the watchdog holds stop.
+  static uint32_t lastEspWarnMs = 0;
+  if (!espNowReady && now - lastEspWarnMs >= 1000) {
+    lastEspWarnMs = now;
+    Serial.println("WARN ESP-NOW init failed — no radio link (motors held stopped)");
+  }
 
   if (now - lastDriveMs >= 10) {
     float dt = (now - lastDriveMs) / 1000.0f;

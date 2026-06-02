@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # Pure-logic host tests (kinematics, curve, normalize, crc8, packet size).
+      - name: Host unit tests
+        run: pio test -e native
+
+      # Compile firmware. No secrets.h on a fresh checkout — protocol.h falls back
+      # to a default MAC, ESPNOW_ENCRYPT defaults 0, so both build clean.
+      # headset env is omitted on purpose: it's an untracked draft, not in the repo.
+      - name: Build robot firmware
+        run: pio run -e robot
+
+      - name: Build controller firmware
+        run: pio run -e controller

@@ -4,6 +4,7 @@
 #include <string.h>
 #include "kinematics.h"
 #include "control_math.h"
+#include "protocol.h"            // CtrlPacket wire format
 #include "config_controller.h"  // CURVE, DEADZONE_RAW, HALF_RANGE
 
 // ---------------- mecanumMix ----------------
@@ -107,6 +108,14 @@ static void test_crc8_detects_corruption(void) {
   TEST_ASSERT_NOT_EQUAL(good, crc8(buf, 8));
 }
 
+// ---------------- protocol ----------------
+
+static void test_packet_wire_size(void) {
+  // Robot drops any frame whose length != sizeof(CtrlPacket); locking the size
+  // here catches accidental layout/alignment drift before it reaches hardware.
+  TEST_ASSERT_EQUAL_UINT32(13, (uint32_t)sizeof(CtrlPacket));
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -126,5 +135,6 @@ int main(void) {
   RUN_TEST(test_normalize_clamps);
   RUN_TEST(test_crc8_known_vector);
   RUN_TEST(test_crc8_detects_corruption);
+  RUN_TEST(test_packet_wire_size);
   return UNITY_END();
 }

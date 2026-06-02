@@ -217,6 +217,17 @@ void setup() {
 
   calibrateCenter();
   setupEspNow();
+
+  // Distinguish a dead radio from merely out-of-range: both otherwise show only
+  // OFFLINE. peerAdded is false on either init or add_peer failure. The banner
+  // persists — with no peer, loop() never sends, so no ack ever redraws status.
+  if (!peerAdded) {
+    M5.Display.fillRect(0, 16, 128, 16, TFT_RED);
+    M5.Display.setTextColor(TFT_WHITE, TFT_RED);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("NO RADIO", 64, 24);
+  }
 }
 
 static uint32_t lastSendMs = 0;

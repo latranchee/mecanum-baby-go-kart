@@ -14,6 +14,12 @@ struct __attribute__((packed)) CtrlPacket {
   uint8_t  crc;       // crc8 over all preceding bytes (control_math.h). MUST be last.
 };
 
+// Wire-format guard. The 13-byte layout is shared verbatim by every TX (robot,
+// controller, headset) and the robot's onRecv rejects any frame whose length !=
+// sizeof(CtrlPacket) — so a silent struct-size drift (added field, alignment
+// change) kills the whole link with zero diagnostics. Fail the build instead.
+static_assert(sizeof(CtrlPacket) == 13, "CtrlPacket wire format must stay 13 bytes");
+
 // Robot MAC + ESP-NOW keys live in secrets.h (gitignored). A fresh clone with no
 // secrets.h still builds via the fallback below. Copy secrets.h.example ->
 // secrets.h and fill in your robot's real MAC (and keys, for #3 encryption).
