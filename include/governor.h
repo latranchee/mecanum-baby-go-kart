@@ -35,11 +35,26 @@
 //   measTps[] : last measured ticks/sec per wheel (signed, encSign-corrected)
 //   outPwm[]  : last commanded PWM per wheel (signed, |.| <= pwmMax)
 //   refTps    : UNIFORM target reference — cmd magnitude 1000 == refTps for every
-//               wheel (= the weakest wheel's max, so all can reach it). The judge
-//               is ABSOLUTE speed against this shared reference: that is what keeps
-//               the cart straight when two battery halves differ. (NOT per-wheel
-//               max — normalizing each wheel to its own max would call a slow weak
-//               wheel "keeping up" and never correct the curve.)
+//               wheel (= the weakest wheel's max, so all can reach it). Used only to
+//               turn each wheel's command into a target speed; the GROUP scale is
+//               judged RELATIVE to the best-tracking wheel, not against this absolute
+//               (see GROUP-RELATIVE note below).
+//
+// GROUP-RELATIVE JUDGE (BUG-001, audit 2026-06-07): a yaw/curve comes from wheels
+// turning at DIFFERENT fractions of their target, NOT from all wheels being slow
+// together. The earlier judge compared each wheel's |meas|/|tgt| to the no-load
+// refTps in ABSOLUTE terms, so any uniform load that held all four wheels below
+// their free-air speed (a payload — the highest-load move short of a block) read as
+// "all four failing" and throttled the WHOLE twist toward GOV_FLOOR. That crawled
+// loaded forward and, worse, made a forward+turn escape the floor only by ADDING
+// yaw (non-additive — the reported spin). Fix: scale the worst SATURATED wheel's
+// ratio by the BEST tracking wheel's ratio (what is actually achievable right now).
+// Uniform load -> worst==best -> scale 1.0 (nothing to cross-correct, the cart is
+// already straight at the achievable common speed). A genuinely lagging/held corner
+// still tracks far below the others -> worst/best is small -> the group slows to
+// match it and stays straight. Pure spin scrubs all four equally -> worst==best ->
+// no throttle (so the old spin-crawl is fixed at the root; the rotation relax below
+// becomes a secondary backstop, not the primary cure).
 //   pwmMax    : PWM_MAX
 //   loScale   : lowest allowed scale, 0..1. 0 => a fully held wheel halts the
 //               cart; ~0.1 leaves a little crawl. 1.0 disables it.
@@ -54,18 +69,14 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
                                         const float outPwm[4], float refTps, float pwmMax,
                                         float loScale, float satFrac,
                                         const bool valid[4]) {
-  float worst = 1.0f;
+  float worstSat = 1.0f;   // worst ratio among SATURATED wheels (limits the group)
+  float bestAll  = 0.0f;   // best ratio among ALL commanded wheels (the achievable)
+  bool  anySat   = false;
   for (int i = 0; i < 4; i++) {
     if (valid && !valid[i]) continue;                 // no usable feedback
     float tgt  = ((float)cmd[i] / 1000.0f) * refTps;
     float atgt = tgt < 0 ? -tgt : tgt;
     if (atgt < 0.05f * refTps) continue;              // ~zero demand: ignore
-
-    // Only a saturated wheel can limit the group. An unsaturated wheel has PWM
-    // headroom to catch up, or is only slow because THIS scale already throttled
-    // it — judging it by that throttled speed is what latched the governor.
-    float aout = outPwm[i] < 0 ? -outPwm[i] : outPwm[i];
-    if (aout < satFrac * pwmMax) continue;            // headroom / throttled: skip
 
     float ameas = measTps[i] < 0 ? -measTps[i] : measTps[i];
     float ratio = ameas / atgt;                       // MAGNITUDE: sign-independent
@@ -75,10 +86,28 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
                     (tgt < 0.0f && measTps[i] > 0.0f);
     if (wrongWay) ratio = 0.0f;
 
-    if (ratio < worst) worst = ratio;
+    // Every commanded wheel contributes to "what is achievable right now" — a
+    // wheel with PWM headroom that is tracking well sets the reference the laggards
+    // are judged against, so uniform load (all equally slow) does not throttle.
+    if (ratio > bestAll) bestAll = ratio;
+
+    // Only a SATURATED wheel can DRAG the group: an unsaturated wheel has headroom
+    // to catch up, or is only slow because THIS scale already throttled it (judging
+    // that throttled speed is what latched the governor at the floor).
+    float aout = outPwm[i] < 0 ? -outPwm[i] : outPwm[i];
+    if (aout < satFrac * pwmMax) continue;            // headroom / throttled: skip
+    anySat = true;
+    if (ratio < worstSat) worstSat = ratio;
   }
-  if (worst < loScale) worst = loScale;
-  return worst;
+
+  if (!anySat) return 1.0f;                           // nothing maxed-out -> no drag
+  if (bestAll < 0.05f) return loScale;                // everything failing -> floor
+  // Group-relative: slow to the laggard's share of the best-tracking wheel. Uniform
+  // load -> worstSat==bestAll -> 1.0; a lagging corner -> worstSat/bestAll < 1.
+  float scale = worstSat / bestAll;
+  if (scale > 1.0f) scale = 1.0f;
+  if (scale < loScale) scale = loScale;
+  return scale;
 }
 
 // Fade the governor's throttle DEPTH by how rotational the commanded twist is.
@@ -102,14 +131,25 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
 //
 //   gScale : the scale from speedGovernorScale (floor..1).
 //   vx,vy,omega : the COMMANDED body twist (cmd units).
+//   relax  : max relaxation depth (1 = governor fully off at pure spin; 0 = off).
+//   transW : translation de-weight in the spin metric, 0..1 (BUG-002). The scrub-
+//            induced false-throttle is created by the ROTATION component, but the
+//            old metric spin = aw/(aw+at) divided relief by TOTAL command, so a
+//            translation-dominant blend (forward + small turn) got almost none —
+//            adding a small turn under load left a deep throttle on the forward
+//            part (non-additive speed). De-weighting translation in the denominator
+//            (spin = aw/(aw + transW*at)) gives such blends proportionally more
+//            relief while leaving the endpoints identical: pure spin (at=0) -> 1,
+//            pure translate (aw=0) -> 0. transW=1 reproduces the old fraction.
 // Pure float/int math, no Arduino deps — host-testable.
 static inline float governorRotationRelax(float gScale, int16_t vx, int16_t vy,
-                                          int16_t omega, float relax) {
+                                          int16_t omega, float relax, float transW) {
   float at = (float)((vx < 0 ? -vx : vx) + (vy < 0 ? -vy : vy));
   float aw = (float)(omega < 0 ? -omega : omega);
-  float denom = aw + at;
+  float denom = aw + transW * at;
   if (denom < 1.0f) return gScale;            // no meaningful command: leave as-is
   float spin = aw / denom;                    // 0..1, 1 == pure rotation
+  if (spin > 1.0f) spin = 1.0f;
   float keep = 1.0f - relax * spin;           // fraction of throttle that survives
   return 1.0f - (1.0f - gScale) * keep;       // fade throttle depth toward 1.0
 }

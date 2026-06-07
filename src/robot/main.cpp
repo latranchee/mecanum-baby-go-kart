@@ -225,7 +225,12 @@ static void pidStep(const int32_t cmd[4], float dt) {
       // (a wheel pinned at PWM_MAX dropping to 0 in one tick defeats the anti-slam
       // intent and shocks the supply). The estop/watchdog path calls motorStopAll()
       // directly for an immediate hard stop, so safety stops are unaffected.
-      pid[i].integral = 0.0f;
+      // (BUG-011) DECAY the integral instead of hard-zeroing it. On a forward+turn
+      // where one side's wheel target transiently crosses zero (fwd≈turn), a hard
+      // dump desynced that wheel from its still-driving partner — an asymmetric
+      // thrust the governor/body loop then read as yaw. A fast decay still clears on
+      // a real stop (sub-tick over ~50ms) but does not slam a momentary zero-cross.
+      pid[i].integral *= 0.5f;
       float prevOut    = lastOutPwm[i];
       float maxPwmStep = PWM_SLEW * dt;
       float out        = 0.0f;
@@ -587,6 +592,12 @@ void loop() {
   if (now - lastDriveMs >= 10) {
     float dt = (now - lastDriveMs) / 1000.0f;
     if (dt <= 0.0f) dt = 0.01f;
+    // (BUG-009) Clamp dt to ~2x nominal. A delayed tick (the 500ms serial log or an
+    // ESP-NOW callback burst runs in this same loop) would otherwise inflate dt and
+    // simultaneously enlarge the CMD_SLEW step, PWM_SLEW step, PID integral step and
+    // body integral step — one coordinated control lurch, worst under payload where
+    // errors are large. The same unbounded dt also widened the encoder glitch clamp.
+    if (dt > 0.05f) dt = 0.05f;
     lastDriveMs = now;
 
     CtrlPacket p;
@@ -616,7 +627,12 @@ void loop() {
       // spans one tick, not the whole stopped interval (no recovery lurch).
       if (wasStopped) {
         for (int i = 0; i < 4; i++) pid[i].lastCount = readCountAtomic(i);
-        govScale = 1.0f;
+        // (BUG-012) Resume conservatively, not at full authority. pidReset() left
+        // govScale=1.0; starting the post-watchdog ramp ungoverned means the first
+        // ticks command a full mecanumMix with no cross-wheel protection (a surge/
+        // yaw lurch). Start at the floor and let GOV_SLEW_UP earn speed back as the
+        // wheels re-measure, so recovery is governed from the first tick.
+        govScale = GOV_FLOOR;
       }
 
       // Base twist -> wheel targets. Slew-limit toward target to cap simultaneous
@@ -651,7 +667,15 @@ void loop() {
       // governor would read as universal failure and throttle to a crawl. Symmetric
       // load is not the held-corner case it exists for, so fade the throttle by how
       // rotational the command is: pure spin -> governor off, translation unchanged.
-      gTarget = governorRotationRelax(gTarget, p.vx, p.vy, p.omega, GOV_SPIN_RELAX);
+      // (BUG-010) Judge the relax on the SLEWED command (decoded from curCmd), not
+      // the raw packet twist: the governor scale being faded was computed from the
+      // slewed curCmd, so on a snap forward->turn the raw p.omega would over-relax a
+      // base whose omega is still ramping in. Decode the body twist from curCmd.
+      int16_t sVxC = (int16_t)((curCmd[0] + curCmd[1] + curCmd[2] + curCmd[3]) / 4);
+      int16_t sVyC = (int16_t)((-curCmd[0] + curCmd[1] + curCmd[2] - curCmd[3]) / 4);
+      int16_t sWC  = (int16_t)((-curCmd[0] + curCmd[1] - curCmd[2] + curCmd[3]) / 4);
+      gTarget = governorRotationRelax(gTarget, sVxC, sVyC, sWC,
+                                      GOV_SPIN_RELAX, GOV_SPIN_RELAX_TRANS_W);
       // Asymmetric slew: fall fast (catch a block), rise slow (smooth resume).
       float gDown = GOV_SLEW_DOWN * dt;
       float gUp   = GOV_SLEW_UP   * dt;
@@ -692,10 +716,16 @@ void loop() {
         bool freezeI = anySat || govScale < BODY_GOV_FREEZE || aS > BODY_SLIP_GATE;
 
         BodyLoopCfg bc = { BODY_KP_TRANS, BODY_KP_W, BODY_KI_TRANS, BODY_KI_W,
-                           BODY_I_MAX, BODY_W_THRESH, BODY_RATE, BODY_CORR_MAX };
+                           BODY_I_MAX, BODY_W_THRESH, BODY_RATE, BODY_CORR_MAX,
+                           BODY_YAW_FWD_FRAC, BODY_I_DECAY };
+        // Throttled forward authority = commanded translation faded by the governor.
+        // Bounds the yaw correction relative to the forward it rides on (BUG-004/005).
+        float aVx = p.vx < 0 ? -(float)p.vx : (float)p.vx;
+        float aVy = p.vy < 0 ? -(float)p.vy : (float)p.vy;
+        float fwdAuth = (aVx + aVy) * govScale;
         float dvx, dvy, dw;
         bodyCorrection((float)p.vx, (float)p.vy, (float)p.omega,
-                       bodyVxF, bodyVyF, bodyWF, freezeI, govScale, dt,
+                       bodyVxF, bodyVyF, bodyWF, freezeI, govScale, fwdAuth, dt,
                        &bc, &bodyState, &dvx, &dvy, &dw);
         lastBodyCorr[0] = dvx; lastBodyCorr[1] = dvy; lastBodyCorr[2] = dw;
 
@@ -704,6 +734,9 @@ void loop() {
         mecanumMix((int16_t)lroundf(dvx), (int16_t)lroundf(dvy),
                    (int16_t)lroundf(dw), corr);
         for (int i = 0; i < 4; i++) driveCmd[i] += corr[i];
+        // Re-normalize the combined base+correction back to a valid <=1000 mecanum
+        // set so the sum never over-commands a single wheel into pidStep (BUG-007).
+        normalizeQuad(driveCmd, 1000);
       }
 #endif
 
