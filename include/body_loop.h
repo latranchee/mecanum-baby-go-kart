@@ -22,10 +22,13 @@
 // HANDOFF INVARIANT with the governor (governor.h): the governor owns MAGNITUDE
 // under saturation, the body loop owns HEADING under non-saturation. Made
 // structural here: the outer integral is FROZEN whenever a wheel is saturated /
-// the governor is throttling / slip is high; and when the governor is active the
-// TRANSLATION correction is faded by govScale while the YAW correction stays at
-// full authority (so "block a corner while driving forward" still gets heading
-// actively resisted even as the governor throttles speed).
+// the governor is throttling / slip is high; and when the governor is active ALL
+// corrections (translation AND yaw) are faded by govScale, so the body loop can
+// never out-authorize a governor-throttled base command (BUG-001 — a full-
+// authority yaw correction on a throttled forward command turned curves into
+// spins). The governor's group-slowing is the primary heading protector when a
+// single corner is blocked; the body loop refines heading only within the
+// authority the governor currently allows.
 //
 // Pure float math, no Arduino deps — host-testable (test/test_math).
 
@@ -42,6 +45,8 @@ struct BodyLoopCfg {
   float wThresh;         // |omega_cmd| (cmd units) above which motion is "rotating"
   float rateLimit;       // correction slew, cmd units/sec
   float corrMax;         // hard per-axis correction clamp, cmd units
+  float yawFwdFrac;      // (BUG-004/005) yaw corr cap as a fraction of throttled fwd
+  float iDecay;          // (BUG-007) frozen-integral bleed rate, 1/s
 };
 
 static inline float bl_clamp(float v, float lim) {
@@ -68,15 +73,19 @@ static inline float bl_rate(float cur, float tgt, float maxStep) {
 
 //   vx_c,vy_c,w_c  : commanded body twist (cmd units, the packet's vx/vy/omega).
 //   vx_m,vy_m,w_m  : measured (IIR-filtered) body twist from forwardKinematics().
-//   freezeIntegral : true => do not integrate this tick (saturation/governor/slip).
-//   govScale       : current governor scale [floor..1]; fades TRANSLATION corr only.
+//   freezeIntegral : true => governor owns magnitude (saturation/throttle/slip):
+//                    decay the integral AND drop the proportional term (BUG-006/007).
+//   govScale       : current governor scale [floor..1]; fades all corrections.
+//   fwdAuth        : current THROTTLED forward authority magnitude (cmd units,
+//                    = |commanded translation| * govScale). Bounds the yaw
+//                    correction relative to forward while translating (BUG-004/005).
 //   dt             : seconds since last call.
 //   cfg, st        : config + persistent state (caller owns lifetime).
 //   out dvx,dvy,dw : rate-limited additive twist correction (cmd units).
 static inline void bodyCorrection(
     float vx_c, float vy_c, float w_c,
     float vx_m, float vy_m, float w_m,
-    bool freezeIntegral, float govScale, float dt,
+    bool freezeIntegral, float govScale, float fwdAuth, float dt,
     const BodyLoopCfg* cfg, BodyLoopState* st,
     float* dvx, float* dvy, float* dw) {
 
@@ -86,15 +95,39 @@ static inline void bodyCorrection(
   float wYaw   = 1.0f - rot;   // yaw-hold dominates when translating
   float wTrans = rot;          // centre-hold dominates when rotating
 
+  // (BUG-003) Track-ratio yaw reference. forwardKinematics has NO load model: on a
+  // curve the deliberately-faster wheels sag more under payload, so the recovered
+  // w_m drops below the commanded w_c even when the chassis is curving CORRECTLY
+  // (just slower) — vx_m sags by the same fraction. Chasing the raw w_c then forces
+  // yaw up while translation stays throttled = curve collapses into a spin. Scale
+  // the yaw reference by the fraction of commanded translation actually achieved:
+  // under uniform sag w_c*trackRatio ≈ w_m so eW≈0 (no phantom yaw), while a REAL
+  // unwanted yaw (translation tracking fine, chassis drifting) still shows full eW.
+  float transCmd  = (vx_c < 0 ? -vx_c : vx_c) + (vy_c < 0 ? -vy_c : vy_c);
+  float transMeas = (vx_m < 0 ? -vx_m : vx_m) + (vy_m < 0 ? -vy_m : vy_m);
+  float trackRatio = 1.0f;
+  if (transCmd > 1.0f) {
+    trackRatio = transMeas / transCmd;
+    if (trackRatio > 1.0f) trackRatio = 1.0f;
+    if (trackRatio < 0.0f) trackRatio = 0.0f;
+  }
+  float wRef = w_c * trackRatio;
+
   float eVx = vx_c - vx_m;
   float eVy = vy_c - vy_m;
-  float eW  = w_c  - w_m;
+  float eW  = wRef - w_m;
 
-  // Integrate only when the governor is NOT in charge (heading authority), and
-  // weight each axis the same way its proportional term is weighted so an axis
-  // that is currently "off" (e.g. translation while driving straight) does not
-  // silently wind up.
-  if (!freezeIntegral) {
+  // Integral: when the governor owns magnitude, DECAY toward zero (BUG-007) so a
+  // value wound up in an unfrozen window cannot HOLD across the freeze threshold
+  // and dump as a heading kick. Otherwise integrate, weighting each axis like its
+  // proportional term so an "off" axis does not silently wind up.
+  if (freezeIntegral) {
+    float dk = cfg->iDecay * dt;
+    if (dk > 1.0f) dk = 1.0f;
+    st->iw -= st->iw * dk;
+    st->ix -= st->ix * dk;
+    st->iy -= st->iy * dk;
+  } else {
     st->iw += eW  * cfg->kiW     * dt * wYaw;
     st->ix += eVx * cfg->kiTrans * dt * wTrans;
     st->iy += eVy * cfg->kiTrans * dt * wTrans;
@@ -104,17 +137,33 @@ static inline void bodyCorrection(
   st->ix = bl_clamp(st->ix, cfg->iMax);
   st->iy = bl_clamp(st->iy, cfg->iMax);
 
-  float corrW  = wYaw   * (cfg->kpW     * eW  + st->iw);
-  float corrVx = wTrans * (cfg->kpTrans * eVx + st->ix);
-  float corrVy = wTrans * (cfg->kpTrans * eVy + st->iy);
+  // (BUG-006) Governor handoff is structural: when frozen the governor owns the
+  // situation, so the body loop yields HEADING too — drop the proportional term
+  // (which would otherwise keep firing on the standing error the governor is
+  // already handling). Only the decaying integral remains. Off-freeze, full P.
+  float pGate = freezeIntegral ? 0.0f : 1.0f;
+  float corrW  = wYaw   * (cfg->kpW     * eW  * pGate + st->iw);
+  float corrVx = wTrans * (cfg->kpTrans * eVx * pGate + st->ix);
+  float corrVy = wTrans * (cfg->kpTrans * eVy * pGate + st->iy);
 
-  // Governor handoff: it throttles MAGNITUDE, so fade translation correction with
-  // govScale — but keep YAW correction at full authority so heading is still
-  // actively resisted while a blocked corner is being throttled.
+  // Fade all corrections by govScale (absolute-jerk bound). NOTE this alone does
+  // NOT bound the curve-vs-spin RATIO — base and correction both scale by govScale
+  // so it cancels in yaw:forward (BUG-004). The relative cap below is what bounds it.
+  corrW  *= govScale;
   corrVx *= govScale;
   corrVy *= govScale;
 
-  corrW  = bl_clamp(corrW,  cfg->corrMax);
+  // (BUG-004/005) While translating, cap the yaw correction to a fraction of the
+  // CURRENT throttled forward authority, not an absolute ±corrMax. So however far
+  // the governor has shrunk forward, yaw stays a minority of it and a curve can
+  // never become a spin. When not translating (fwdAuth≈0) the yaw-hold weight is
+  // ~0 anyway; fall back to the absolute clamp.
+  float capW = cfg->corrMax;
+  if (fwdAuth > 1.0f) {
+    float rel = cfg->yawFwdFrac * fwdAuth;
+    if (rel < capW) capW = rel;
+  }
+  corrW  = bl_clamp(corrW,  capW);
   corrVx = bl_clamp(corrVx, cfg->corrMax);
   corrVy = bl_clamp(corrVy, cfg->corrMax);
 

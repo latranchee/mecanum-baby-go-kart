@@ -17,20 +17,31 @@
 //   To verify on the floor: in robot test mode send `t 0 500 0` (vy=+500). If the
 //   robot strafes LEFT, the sign is wrong — flip the vy terms below (FL+vy, FR-vy,
 //   RL-vy, RR+vy) and update the test. If it strafes RIGHT, leave as-is.
+// Scale a 4-wheel command set so its peak magnitude does not exceed `limit`,
+// preserving the ratio between wheels (direction unchanged). `limit` must be > 0.
+// Used by mecanumMix AND by the drive loop to re-normalize the governor-scaled
+// base PLUS the body-loop correction as ONE valid mecanum set (BUG-007): without
+// it, base+correction could push a single wheel past ±1000 into pidStep, pinning
+// one wheel while peers do not — reintroducing the cross-wheel yaw the outer
+// loops exist to remove. Pure integer math, host-testable.
+static inline void normalizeQuad(int32_t c[4], int32_t limit) {
+  int32_t peak = limit;
+  for (int i = 0; i < 4; i++) {
+    int32_t a = c[i] < 0 ? -c[i] : c[i];
+    if (a > peak) peak = a;
+  }
+  if (peak > limit) {
+    for (int i = 0; i < 4; i++) c[i] = (c[i] * limit) / peak;
+  }
+}
+
 static inline void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t outCmd[4]) {
   outCmd[0] = (int32_t)vx - vy - omega;  // FL
   outCmd[1] = (int32_t)vx + vy + omega;  // FR
   outCmd[2] = (int32_t)vx + vy - omega;  // RL
   outCmd[3] = (int32_t)vx - vy + omega;  // RR
 
-  int32_t peak = 1000;
-  for (int i = 0; i < 4; i++) {
-    int32_t a = outCmd[i] < 0 ? -outCmd[i] : outCmd[i];
-    if (a > peak) peak = a;
-  }
-  if (peak > 1000) {
-    for (int i = 0; i < 4; i++) outCmd[i] = (outCmd[i] * 1000) / peak;
-  }
+  normalizeQuad(outCmd, 1000);
 }
 
 // Forward kinematics — recover the body twist (vx,vy,omega) and a slip/null

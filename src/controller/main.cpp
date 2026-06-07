@@ -273,16 +273,25 @@ void loop() {
   //   RIGHT stick: VERT (UP=fwd)    -> vx add (both stick verts sum)
   //                HORIZ (RIGHT=CW) -> omega (CW = negative; protocol: omega>0 CCW)
   // normalize() returns +DOWN / +RIGHT (see lines 193-195), so UP requires negation.
-  int16_t vy_raw    =  lHorizN;
-  int16_t omega_raw = -rHorizN;
-  // vx: sum both stick verts, clamp to normalized range (opposing pushes cancel).
-  int16_t vx_raw    = (int16_t)constrain((int32_t)(-lVertN) + (int32_t)(-rVertN), -1000, 1000);
+  // Base mapping (normalize() = +DOWN/+RIGHT, so UP=fwd requires negation).
+  // Per-axis inversion via INVERT_* toggles in config_controller.h.
+  const int sVx = INVERT_VX ? -1 : 1, sVy = INVERT_VY ? -1 : 1, sW = INVERT_OMEGA ? -1 : 1;
+  int16_t vy_raw    = (int16_t)(sVy *  lHorizN);
+  int16_t omega_raw = (int16_t)(sW  * -rHorizN);
+  // vx: left stick vert always; right stick vert too unless decoupled (BUG-011).
+  // Clamp to normalized range (opposing pushes cancel).
+  int32_t vxSum = (int32_t)(-lVertN);
+#if VX_FROM_BOTH_STICKS
+  vxSum += (int32_t)(-rVertN);
+#endif
+  int16_t vx_raw    = (int16_t)constrain((int32_t)sVx * vxSum, -1000, 1000);
 
-  // Apply S-curve then scale by speedPct (top-end limit).
+  // Apply response curve then scale by speedPct (top-end limit). omega uses the
+  // gentler CURVE_OMEGA so small turns are responsive and additive (BUG-010/011).
   float scale = (float)speedPct / 100.0f;
-  int16_t vx    = (int16_t)(applyCurve(vx_raw,    CURVE) * scale * 1000.0f);
-  int16_t vy    = (int16_t)(applyCurve(vy_raw,    CURVE) * scale * 1000.0f);
-  int16_t omega = (int16_t)(applyCurve(omega_raw, CURVE) * scale * 1000.0f);
+  int16_t vx    = (int16_t)(applyCurve(vx_raw,    CURVE)       * scale * 1000.0f);
+  int16_t vy    = (int16_t)(applyCurve(vy_raw,    CURVE)       * scale * 1000.0f);
+  int16_t omega = (int16_t)(applyCurve(omega_raw, CURVE_OMEGA) * scale * 1000.0f);
 
   // E-stop: both joystick clicks held
   uint8_t flags = 0;
