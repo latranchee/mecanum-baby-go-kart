@@ -603,6 +603,22 @@ static void test_packet_wire_size(void) {
   TEST_ASSERT_EQUAL_UINT32(13, (uint32_t)sizeof(CtrlPacket));
 }
 
+static void test_ctrl_flags_from_preset(void) {
+  // FULL preset (no disable bits, no estop) MUST be 0 — the legacy-safe value a
+  // headset or un-updated sender emits, meaning "all features ON".
+  TEST_ASSERT_EQUAL_UINT8(0, ctrlFlagsFromPreset(0, false));
+  // Disable bits pass through verbatim.
+  TEST_ASSERT_EQUAL_UINT8(CTRL_FLAG_GOV_OFF, ctrlFlagsFromPreset(CTRL_FLAG_GOV_OFF, false));
+  // RAW preset: all three feature bits set, no estop.
+  uint8_t raw = CTRL_FLAG_GOV_OFF | CTRL_FLAG_CL_OFF | CTRL_FLAG_BODY_OFF;
+  TEST_ASSERT_EQUAL_UINT8(raw, ctrlFlagsFromPreset(raw, false));
+  // estop ORs in bit0 alongside the disable bits, never disturbing them.
+  TEST_ASSERT_EQUAL_UINT8((uint8_t)(raw | CTRL_FLAG_ESTOP), ctrlFlagsFromPreset(raw, true));
+  TEST_ASSERT_EQUAL_UINT8(CTRL_FLAG_ESTOP, ctrlFlagsFromPreset(0, true));
+  // estop bit in the disableBits arg is masked out (only the *_OFF bits are kept).
+  TEST_ASSERT_EQUAL_UINT8(0, ctrlFlagsFromPreset(CTRL_FLAG_ESTOP, false));
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -662,5 +678,6 @@ int main(void) {
   RUN_TEST(test_crc8_known_vector);
   RUN_TEST(test_crc8_detects_corruption);
   RUN_TEST(test_packet_wire_size);
+  RUN_TEST(test_ctrl_flags_from_preset);
   return UNITY_END();
 }

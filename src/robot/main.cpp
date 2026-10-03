@@ -154,6 +154,14 @@ static int32_t curCmd[4] = { 0, 0, 0, 0 };
 // Cross-wheel governor: low-passed group scale applied to all wheel commands.
 static float govScale = 1.0f;
 
+// Runtime feature toggles (RAM-only, no NVS). Initialized from the compile-time
+// defaults so boot behaviour is unchanged; flipped live by the controller's mode
+// bits (field) or the serial g/c/b commands (bench). A power cycle restores these
+// defaults. Independent — any combination is valid. See config_robot.h.
+static bool enableGovernor  = SYNC_GOVERNOR;
+static bool enableClosedLoop = CLOSED_LOOP_DEFAULT;
+static bool enableBodyLoop  = BODY_LOOP;
+
 // Body-space outer loop: persistent state + IIR-filtered chassis-twist estimate.
 static BodyLoopState bodyState = { 0, 0, 0, 0, 0, 0 };
 static float bodyVxF = 0, bodyVyF = 0, bodyWF = 0, bodySF = 0;  // filtered vx,vy,omega,slip
@@ -255,6 +263,28 @@ static void pidStep(const int32_t cmd[4], float dt) {
       pid[i].lastCount = now;
       lastTargetTps[i] = targetTps;
       lastMeasTps[i]   = 0.0f;
+      lastOutPwm[i]    = out;
+      continue;
+    }
+
+    // Global open-loop TEST toggle (encoder healthy): feed-forward only, no P/I.
+    // Distinct from the per-wheel openLoop[] dead-encoder branch above — here the
+    // encoder works, so lastMeasTps stays REAL (the dead-encoder branch zeros it),
+    // keeping the governor, body loop, telemetry and stall detection truthful
+    // during an A/B. Apply the SAME actuator dynamics as the PI path (PWM_MAX
+    // clamp + PWM_SLEW) so only the control law differs, not the actuator.
+    if (!enableClosedLoop) {
+      float prevOut    = lastOutPwm[i];
+      float maxPwmStep = PWM_SLEW * dt;
+      float out        = kff * targetTps;
+      if (out >  PWM_MAX) out =  PWM_MAX;
+      if (out < -PWM_MAX) out = -PWM_MAX;
+      if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
+      if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+      pid[i].integral  = 0.0f;            // clean re-enable (no stale windup)
+      motorWrite(i, (int16_t)lroundf(out));
+      lastTargetTps[i] = targetTps;
+      lastMeasTps[i]   = measuredTps;     // REAL measurement (encoder healthy)
       lastOutPwm[i]    = out;
       continue;
     }
@@ -396,11 +426,30 @@ static void handleCommand(char* line) {
       pidReset();
       Serial.println("OK x");
       break;
+    case 'g': {
+      char* a = strtok(NULL, " \t");
+      if (a) enableGovernor = atoi(a) != 0;
+      Serial.printf("OK g %d\n", enableGovernor);
+      break;
+    }
+    case 'c': {
+      char* a = strtok(NULL, " \t");
+      if (a) enableClosedLoop = atoi(a) != 0;
+      Serial.printf("OK c %d\n", enableClosedLoop);
+      break;
+    }
+    case 'b': {
+      char* a = strtok(NULL, " \t");
+      if (a) enableBodyLoop = atoi(a) != 0;
+      Serial.printf("OK b %d\n", enableBodyLoop);
+      break;
+    }
     case '?': {
       CtrlPacket p;
       getPacketSnapshot(p);
-      Serial.printf("STATUS testMode=%d src=%s packet vx=%d vy=%d omega=%d slotPwm=[%d %d %d %d]\n",
+      Serial.printf("STATUS testMode=%d src=%s en=[gov=%d cl=%d body=%d] packet vx=%d vy=%d omega=%d slotPwm=[%d %d %d %d]\n",
                     testMode ? 1 : 0, testSrc == TS_DIRECT ? "DIRECT" : "MIX",
+                    enableGovernor, enableClosedLoop, enableBodyLoop,
                     p.vx, p.vy, p.omega,
                     slotPwm[0], slotPwm[1], slotPwm[2], slotPwm[3]);
       break;
@@ -448,10 +497,11 @@ static void emitTlm(uint32_t now) {
   float vb = readBattVolts();
   if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
 
-  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] gov=%.2f body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
+  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] gov=%.2f en=[%d %d %d] body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
                 (unsigned long)now,
                 (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
                 govScale,
+                enableGovernor, enableClosedLoop, enableBodyLoop,
                 bodyVxF, bodyVyF, bodyWF, bodySF,
                 lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
                 lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
@@ -621,6 +671,17 @@ void loop() {
       pidReset();
       wasStopped = false;
     } else {
+      // Field control: mirror the controller's selected mode (DISABLE bits) into
+      // the runtime flags so the operator's live selection takes effect. Only on
+      // the ESP-NOW path: in testMode the serial g/c/b commands own the flags (and
+      // ESP-NOW is ignored in onRecv anyway). flags==0 (headset / legacy sender)
+      // clears all DISABLE bits -> every feature ON -> unchanged behaviour.
+      if (!testMode) {
+        enableGovernor   = !(p.flags & CTRL_FLAG_GOV_OFF);
+        enableClosedLoop = !(p.flags & CTRL_FLAG_CL_OFF);
+        enableBodyLoop   = !(p.flags & CTRL_FLAG_BODY_OFF);
+      }
+
       // Resuming from a stopped state (watchdog/estop release): the wheels may
       // have been nudged by hand while pidStep was skipped, so pid[].lastCount is
       // stale. Re-baseline it to the current count so the first velocity estimate
@@ -655,7 +716,7 @@ void loop() {
       // so a transient accel lag can't collapse drive. govScale eases back to 1.0
       // as the lagging wheel recovers. Judged on the BASE twist (curCmd).
       int32_t driveCmd[4];
-#if SYNC_GOVERNOR
+      if (enableGovernor) {
       bool valid[4] = { !openLoop[0], !openLoop[1], !openLoop[2], !openLoop[3] };
       // Judge wheels by magnitude + output saturation (sign-independent), so a
       // held wheel is caught identically in forward and reverse. Uses last tick's
@@ -682,9 +743,9 @@ void loop() {
       if      (gTarget < govScale - gDown) govScale -= gDown;
       else if (gTarget > govScale + gUp)   govScale += gUp;
       else                                  govScale  = gTarget;
-#else
-      govScale = 1.0f;
-#endif
+      } else {
+        govScale = 1.0f;
+      }
       for (int i = 0; i < 4; i++) driveCmd[i] = (int32_t)lroundf(curCmd[i] * govScale);
 
       // Body-space outer loop: estimate the chassis twist from the wheels and add
@@ -693,8 +754,7 @@ void loop() {
       // yawing"). The correction is an additive wheel-space twist added AFTER the
       // governor scale, so its yaw authority survives while the governor throttles
       // base magnitude. See body_loop.h.
-#if BODY_LOOP
-      {
+      if (enableBodyLoop) {
         const float refTps = maxTpsMin();
         float vx_m, vy_m, w_m, s_m;
         forwardKinematics(lastMeasTps, refTps, &vx_m, &vy_m, &w_m, &s_m);
@@ -738,7 +798,6 @@ void loop() {
         // set so the sum never over-commands a single wheel into pidStep (BUG-007).
         normalizeQuad(driveCmd, 1000);
       }
-#endif
 
       pidStep(driveCmd, dt);
       wasStopped = false;
@@ -771,10 +830,11 @@ void loop() {
     if (wheelStalled[0] || wheelStalled[1] || wheelStalled[2] || wheelStalled[3])
       snprintf(stall, sizeof(stall), " STALL=[%d %d %d %d]",
                wheelStalled[0], wheelStalled[1], wheelStalled[2], wheelStalled[3]);
-    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] gov=%.2f body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s%s\n",
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] gov=%.2f en=[%d %d %d] body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s%s\n",
                   (unsigned long)p.seq, p.vx, p.vy, p.omega,
                   (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
                   govScale,
+                  enableGovernor, enableClosedLoop, enableBodyLoop,
                   bodyVxF, bodyVyF, bodyWF, bodySF,
                   lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
                   lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],

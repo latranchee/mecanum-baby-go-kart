@@ -19,9 +19,12 @@ static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed 
 // is what lets feed-forward + the governor normalize correctly (the whole point
 // of this change). Calibrate with tools/calibrate_maxtps.py (wheels off ground).
 // Feed-forward gain is derived per wheel as PWM_MAX / MAX_TPS[i] at use site.
-// Measured 2026-06-02 (4x decode, no-load, full PWM, min of fwd/rev per wheel):
-// wheels within ~5% — packs well matched at no-load. RR weakest = uniform ref.
-static const float MAX_TPS[4] = { 8275.0f, 8483.0f, 8342.0f, 8230.0f };
+// Measured 2026-06-07 (2-battery / dual-20A-buck rig, 4x decode, no-load, full PWM,
+// min of fwd/rev per wheel): wheels within ~3% (skew <2.5%) — rails well matched,
+// no buck mismatch. FL weakest = uniform ref. Supersedes the 2026-06-02 single-buck
+// values (8275/8483/8342/8230), which under-stated by ~3% so cmd 1000 targeted below
+// the wheels' real top speed. Recalibrate again whenever the supply changes.
+static const float MAX_TPS[4] = { 8502.0f, 8688.0f, 8778.0f, 8669.0f };
 // Smallest per-wheel max — used where one scalar reference is still needed.
 static inline float maxTpsMin() {
   float m = MAX_TPS[0];
@@ -57,8 +60,19 @@ static const float PWM_SLEW = 2500.0f;  // full 0..1023 in ~410ms
 //                the fix for the old latch where forward drive stuck at the floor.
 //   GOV_SLEW   : how fast the applied scale may move (1/sec), low-passed so a
 //                transient startup lag can't collapse drive and recovery is smooth.
+// The three stacked control features — this cross-wheel governor, the per-wheel
+// closed-loop PI, and the body-space outer loop (below) — are INDEPENDENT runtime
+// toggles. Each compile macro here (SYNC_GOVERNOR / CLOSED_LOOP_DEFAULT /
+// BODY_LOOP) only sets the BOOT default; src/robot/main.cpp mirrors them into RAM
+// flags the controller (or serial g/c/b) can flip live for A/B testing. A power
+// cycle returns to these compile defaults.
 #ifndef SYNC_GOVERNOR
 #define SYNC_GOVERNOR 1
+#endif
+// Per-wheel closed-loop PI default. 1 = closed loop (FF + P/I on measured speed);
+// 0 = open-loop feed-forward only. Runtime-toggleable (CTRL_FLAG_CL_OFF / `c`).
+#ifndef CLOSED_LOOP_DEFAULT
+#define CLOSED_LOOP_DEFAULT 1
 #endif
 static const float GOV_FLOOR    = 0.10f;
 static const float GOV_SAT_FRAC = 0.85f;  // |out| >= 85% PWM_MAX = wheel maxed out

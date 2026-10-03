@@ -132,6 +132,23 @@ static void setupEspNow() {
   }
 }
 
+// ---------------- Feature-mode presets ----------------
+// Left joystick-click cycles this ordered list. Each entry = display name + the
+// DISABLE bits sent in CtrlPacket.flags (protocol.h). FULL = nothing disabled =
+// every robot feature ON (legacy behaviour). The robot mirrors these bits into
+// its runtime toggles each packet, so the controller is authoritative in the field.
+struct ModePreset { const char* name; uint8_t disableBits; };
+static const ModePreset MODE_PRESETS[] = {
+  { "FULL",    0 },
+  { "NO GOV",  CTRL_FLAG_GOV_OFF },
+  { "NO BODY", CTRL_FLAG_BODY_OFF },
+  { "OPEN LP", CTRL_FLAG_CL_OFF },
+  { "RAW",     CTRL_FLAG_GOV_OFF | CTRL_FLAG_CL_OFF | CTRL_FLAG_BODY_OFF },
+};
+static const uint8_t NMODES      = sizeof(MODE_PRESETS) / sizeof(MODE_PRESETS[0]);
+static uint8_t       modeIdx     = 0;
+static uint8_t       lastModeIdx = 0xFF;   // != any valid idx -> force first draw
+
 // ---------------- Display ----------------
 // AtomS3 LCD is 128x128. Layout:
 //   Header bar: "MECANUM"
@@ -161,13 +178,22 @@ static void drawStatus(bool connected) {
 }
 
 static void drawSpeedCompact(uint8_t pct) {
-  M5.Display.fillRect(0, 34, 128, 10, TFT_BLACK);
+  M5.Display.fillRect(0, 34, 60, 10, TFT_BLACK);   // left half — drawMode owns right
   M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(1);
   char buf[16];
   snprintf(buf, sizeof(buf), "SPD %u%%", pct);
   M5.Display.drawString(buf, 4, 35);
+}
+
+// Active feature-mode preset name, right side of the SPD row.
+static void drawMode(uint8_t idx) {
+  M5.Display.fillRect(60, 34, 68, 10, TFT_BLACK);  // right half of the SPD row
+  M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5.Display.setTextDatum(top_right);
+  M5.Display.setTextSize(1);
+  M5.Display.drawString(MODE_PRESETS[idx].name, 124, 35);
 }
 
 // Physical-deflection labels (sign convention validated by working code):
@@ -198,6 +224,7 @@ static void initDisplay() {
   drawHeader();
   drawStatus(false);
   drawSpeedCompact(speedPct);
+  drawMode(modeIdx);
   drawSticks(0, 0, 0, 0);
 }
 
@@ -259,6 +286,9 @@ void loop() {
   uint8_t pressed = btnMask & ~lastBtnMask;
   if (pressed & 0x02) speedPct = (speedPct >= 100)         ? 100        : speedPct + SPEED_STEP;
   if (pressed & 0x01) speedPct = (speedPct <= SPEED_STEP)  ? SPEED_STEP : speedPct - SPEED_STEP;
+  // Left joystick-click cycles the feature-mode preset — but NOT while RightJoyBtn
+  // is also held (that combo is the e-stop), so reaching for e-stop never cycles.
+  if ((pressed & 0x04) && !(btnMask & 0x08)) modeIdx = (modeIdx + 1) % NMODES;
   lastBtnMask = btnMask;
 
   // Normalize stick deflections to [-1000..+1000]. Names reflect actual physical axes.
@@ -293,9 +323,10 @@ void loop() {
   int16_t vy    = (int16_t)(applyCurve(vy_raw,    CURVE)       * scale * 1000.0f);
   int16_t omega = (int16_t)(applyCurve(omega_raw, CURVE_OMEGA) * scale * 1000.0f);
 
-  // E-stop: both joystick clicks held
-  uint8_t flags = 0;
-  if ((btnMask & 0x0C) == 0x0C) flags |= 0x01;
+  // Flags: e-stop (both joystick clicks held) ORed with the active preset's
+  // feature DISABLE bits. flags==0 (FULL, no estop) = all robot features ON.
+  uint8_t flags = ctrlFlagsFromPreset(MODE_PRESETS[modeIdx].disableBits,
+                                      (btnMask & 0x0C) == 0x0C);
 
   CtrlPacket pkt = { ++seq, vx, vy, omega, btnMask, flags, 0 };
   pkt.crc = crc8((const uint8_t*)&pkt, offsetof(CtrlPacket, crc));  // integrity (#4)
@@ -313,14 +344,18 @@ void loop() {
       drawSpeedCompact(speedPct);
       lastSpeedPct = speedPct;
     }
+    if (modeIdx != lastModeIdx) {
+      drawMode(modeIdx);
+      lastModeIdx = modeIdx;
+    }
     drawSticks(lVertN, lHorizN, rVertN, rHorizN);
   }
 
   // Serial log @ 5Hz
   if (now - lastLogMs >= 200) {
     lastLogMs = now;
-    Serial.printf("seq=%lu spd=%u%% btn=%02X conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
-                  (unsigned long)seq, speedPct, btnMask,
+    Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
+                  (unsigned long)seq, speedPct, MODE_PRESETS[modeIdx].name, btnMask,
                   (now - lastAckMs) < 500 ? 1 : 0,
                   lHoriz, lVert, rHoriz, rVert, vx, vy, omega);
   }
