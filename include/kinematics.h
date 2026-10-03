@@ -51,7 +51,7 @@ static inline void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t out
 //
 //   measTps[i] : measured signed ticks/sec per wheel, slot order [FL,FR,RL,RR]
 //                (the encSign-corrected, glitch-clamped lastMeasTps[]).
-//   refTps     : UNIFORM normalization reference (= maxTpsMin()) — the SAME scalar
+//   refTps     : UNIFORM normalization reference (= cmdRefTps()) — the SAME scalar
 //                the inner loop targets for cmd 1000. Dividing by it puts the body
 //                estimate back in cmd units (+/-1000 == refTps). MUST NOT be the
 //                per-wheel MAX_TPS[i]: normalizing each wheel to its own max would

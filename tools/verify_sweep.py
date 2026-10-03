@@ -10,7 +10,10 @@ EXPECTED = {
     'omega+': [-1, +1, -1, +1],
     'omega-': [+1, -1, +1, -1],
 }
-TARGET_MAG = 0.4 * 2100  # 840
+# Mirrors include/config_robot.h: cmd 1000 targets SPEED_REF_FRAC * min(MAX_TPS).
+SPEED_REF_FRAC = 0.80
+MAX_TPS_MIN = 8502
+TARGET_MAG = 0.4 * SPEED_REF_FRAC * MAX_TPS_MIN  # sweep stimuli are cmd 400
 MAG_TOL = 0.4
 
 def steady_state(csv_path):

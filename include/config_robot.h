@@ -31,6 +31,18 @@ static inline float maxTpsMin() {
   for (int i = 1; i < 4; i++) if (MAX_TPS[i] < m) m = MAX_TPS[i];
   return m;
 }
+// Commanded-speed reference: cmd 1000 targets this fraction of the weakest wheel's
+// NO-LOAD speed, not all of it. At 1.0 the feed-forward alone (PWM_MAX * ref /
+// MAX_TPS[i]) put every wheel at 97-100% PWM, and past GOV_SAT_FRAC from ~850 wheel
+// command up with no load at all — so near full stick the body loop froze itself
+// (anySat) and the PI had no PWM left to pull a lagging wheel up: open loop exactly
+// where a loaded cart needs the loop. At 0.80, full-stick feed-forward is ~80% PWM:
+// 5 points under the saturation gate, 20 under the rail. Cost: the same stick and
+// speed setting now drive 20% slower. Must stay under GOV_SAT_FRAC with margin
+// (test_full_cmd_feedforward_headroom).
+static const float SPEED_REF_FRAC = 0.80f;
+// The one speed cmd 1000 means on every wheel (ticks/sec).
+static inline float cmdRefTps() { return SPEED_REF_FRAC * maxTpsMin(); }
 static const float Kp      = 0.15f;
 static const float Ki      = 0.3f;                      // glitch rejection now guards windup, so raise Ki back up to regulate weak/loaded wheels (was under-driving right side -> drift)
 static const float I_MAX   = 0.55f * (float)PWM_MAX;    // bound integral authority (~563)

@@ -603,6 +603,20 @@ static void test_clamp_slew_hard_limit_wins(void) {
   TEST_ASSERT_EQUAL_FLOAT(-1023.0f, clampSlew(-5000.0f, -1020.0f, 1023.0f, 25.0f));
 }
 
+// ---------------- speed reference headroom ----------------
+
+static void test_full_cmd_feedforward_headroom(void) {
+  // cmd 1000 feed-forward ALONE must sit under the governor's saturation gate on
+  // every wheel, with margin. Otherwise full stick reads "saturated" at no load:
+  // the body loop freezes itself and the PI has no PWM left for a lagging wheel.
+  // Trips if SPEED_REF_FRAC is raised or MAX_TPS[] is recalibrated far apart.
+  const float gate = (GOV_SAT_FRAC - 0.03f) * (float)PWM_MAX;
+  for (int i = 0; i < 4; i++) {
+    float ff = (float)PWM_MAX / MAX_TPS[i] * cmdRefTps();
+    TEST_ASSERT_TRUE(ff < gate);
+  }
+}
+
 // ---------------- crc8 ----------------
 
 static void test_crc8_known_vector(void) {
@@ -700,6 +714,7 @@ int main(void) {
   RUN_TEST(test_clamp_slew_passes_reachable_target);
   RUN_TEST(test_clamp_slew_caps_step_both_ways);
   RUN_TEST(test_clamp_slew_hard_limit_wins);
+  RUN_TEST(test_full_cmd_feedforward_headroom);
   RUN_TEST(test_crc8_known_vector);
   RUN_TEST(test_crc8_detects_corruption);
   RUN_TEST(test_packet_wire_size);

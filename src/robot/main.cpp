@@ -228,10 +228,10 @@ static void pidStep(const int32_t cmd[4], float dt) {
     float measuredTps = encSign[i] * (float)delta / dt;
 
     // Feed-forward is per-wheel (a weak-battery wheel needs more PWM per tick/sec),
-    // but the TARGET is a UNIFORM absolute speed capped at the weakest wheel
-    // (refTps = maxTpsMin) so cmd 1000 means the same ground speed on every wheel
+    // but the TARGET is a UNIFORM absolute speed referenced to the weakest wheel
+    // (refTps = cmdRefTps) so cmd 1000 means the same ground speed on every wheel
     // and the cart drives straight. A strong wheel simply uses less of its range.
-    const float refTps    = maxTpsMin();
+    const float refTps    = cmdRefTps();
     const float kff       = (float)PWM_MAX / MAX_TPS[i];  // per-wheel feed-forward
     float targetTps = ((float)cmd[i] / 1000.0f) * refTps;
 
@@ -728,7 +728,7 @@ void loop() {
       // held wheel is caught identically in forward and reverse. Uses last tick's
       // measured speeds and PWM.
       float gTarget = speedGovernorScale(curCmd, lastMeasTps, lastOutPwm,
-                                         maxTpsMin(), (float)PWM_MAX,
+                                         cmdRefTps(), (float)PWM_MAX,
                                          GOV_FLOOR, GOV_SAT_FRAC, valid);  // uniform ref
       // Spin-in-place scrubs all wheels equally below the no-load refTps, which the
       // governor would read as universal failure and throttle to a crawl. Symmetric
@@ -761,7 +761,7 @@ void loop() {
       // governor scale, so its yaw authority survives while the governor throttles
       // base magnitude. See body_loop.h.
       if (enableBodyLoop) {
-        const float refTps = maxTpsMin();
+        const float refTps = cmdRefTps();
         float vx_m, vy_m, w_m, s_m;
         forwardKinematics(lastMeasTps, refTps, &vx_m, &vy_m, &w_m, &s_m);
         // Single-pole IIR on the body estimate (heavier on noisy omega/vy).

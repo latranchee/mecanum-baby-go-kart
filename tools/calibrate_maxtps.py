@@ -113,8 +113,8 @@ def main() -> int:
     print(f"static const float MAX_TPS[4] = {{ {maxtps[0]:.0f}.0f, {maxtps[1]:.0f}.0f, "
           f"{maxtps[2]:.0f}.0f, {maxtps[3]:.0f}.0f }};")
     weakest = min(maxtps)
-    print(f"\nWeakest wheel (the uniform target ref) = {weakest:.0f} tps"
-          f" ({SLOTS[maxtps.index(weakest)]}).")
+    print(f"\nWeakest wheel = {weakest:.0f} tps ({SLOTS[maxtps.index(weakest)]})."
+          " cmd 1000 targets SPEED_REF_FRAC of it; update MAX_TPS_MIN in verify_sweep.py too.")
     if weakest > 0 and max(maxtps) / weakest > 1.2:
         print("NOTE: >20% spread across wheels — the two battery halves are mismatched."
               "\n      Top speed is capped to the weakest. Match pack V/SoC to raise it.")
