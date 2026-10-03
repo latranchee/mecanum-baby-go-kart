@@ -594,6 +594,11 @@ static void setupEspNow() {
 
 // ---------------- main ----------------
 void setup() {
+  // TX ring buffer (must precede begin). The default is none, so a log line longer
+  // than the 128-byte UART FIFO blocks loop() until its tail drains at 115200 —
+  // ~4-6 ms per TLM/status line, inside a 10 ms control tick. TLM peaks near
+  // 4 kB/s against an 11.5 kB/s drain, so the buffer never fills.
+  Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(200);
   Serial.println("\nmecanum robot: ESP-NOW + mecanum kinematics");
