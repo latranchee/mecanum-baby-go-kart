@@ -202,20 +202,26 @@ static void drawMode(uint8_t idx) {
 static const char* vertLabel(int n)  { return (n > 0) ? "DN" : ((n < 0) ? "UP" : "--"); }
 static const char* horizLabel(int n) { return (n > 0) ? "RT" : ((n < 0) ? "LT" : "--"); }
 
+// Stick readout: four fixed-width rows ("L V:UP 42"). A row is redrawn only when
+// its text changed, and with an opaque background, so it overwrites itself in
+// place. No panel clear: that was a 128x82 fill plus four rows of text over SPI
+// every 100 ms whether the sticks moved or not, and it flickered.
 static void drawSticks(int16_t lVertN, int16_t lHorizN, int16_t rVertN, int16_t rHorizN) {
-  M5.Display.fillRect(0, 46, 128, 82, TFT_BLACK);
+  static char shown[4][16];   // text on screen per row; "" until first drawn
+  char rows[4][16];
+  snprintf(rows[0], sizeof(rows[0]), "L V:%s%3d", vertLabel(lVertN),   abs(lVertN)/10);
+  snprintf(rows[1], sizeof(rows[1]), "L H:%s%3d", horizLabel(lHorizN), abs(lHorizN)/10);
+  snprintf(rows[2], sizeof(rows[2]), "R V:%s%3d", vertLabel(rVertN),   abs(rVertN)/10);
+  snprintf(rows[3], sizeof(rows[3]), "R H:%s%3d", horizLabel(rHorizN), abs(rHorizN)/10);
+
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setTextDatum(top_left);
   M5.Display.setTextSize(2);
-  char buf[16];
-  snprintf(buf, sizeof(buf), "L V:%s%3d", vertLabel(lVertN),   abs(lVertN)/10);
-  M5.Display.drawString(buf, 2, 48);
-  snprintf(buf, sizeof(buf), "L H:%s%3d", horizLabel(lHorizN), abs(lHorizN)/10);
-  M5.Display.drawString(buf, 2, 68);
-  snprintf(buf, sizeof(buf), "R V:%s%3d", vertLabel(rVertN),   abs(rVertN)/10);
-  M5.Display.drawString(buf, 2, 88);
-  snprintf(buf, sizeof(buf), "R H:%s%3d", horizLabel(rHorizN), abs(rHorizN)/10);
-  M5.Display.drawString(buf, 2, 108);
+  for (uint8_t r = 0; r < 4; r++) {
+    if (strcmp(rows[r], shown[r]) == 0) continue;
+    M5.Display.drawString(rows[r], 2, 48 + 20 * r);
+    strcpy(shown[r], rows[r]);
+  }
 }
 
 static void initDisplay() {
