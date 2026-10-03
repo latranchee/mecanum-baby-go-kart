@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_system.h>   // esp_reset_reason()
+#include <driver/pulse_cnt.h>  // PCNT quadrature decode
 #include "protocol.h"
 #include "config_robot.h"
 #include "kinematics.h"     // mecanumMix() + forwardKinematics()
@@ -40,7 +41,6 @@ static const Motor motors[4] = {
 
 // PWM_FREQ / PWM_RES / PWM_MAX / DEADBAND now in config_robot.h.
 
-static volatile long encCount[4] = { 0, 0, 0, 0 };
 // Derived from solo-PWM test: +PWM raw_tps signs [-, +, -, +] for [FL,FR,RL,RR].
 static const int8_t encSign[4]   = { -1, +1, -1, +1 };
 
@@ -49,37 +49,70 @@ static const int8_t encSign[4]   = { -1, +1, -1, +1 };
 // flip an entry true if that encoder fails, so its wheel still drives.
 static const bool openLoop[4] = { false, false, false, false };
 
-// Full 4x quadrature decode (BUG-008 fixed 2026-06-02). Interrupt on CHANGE of
-// BOTH channels; each A/B edge advances a 2-bit state and a transition lookup
-// adds +1/-1 (or 0 for no-change / illegal double-step). This rejects the phantom
-// counts the old 1x decode streamed when a held wheel dithered encA: a real
-// rotation walks the Gray sequence (net +/-), but dither bounces between two
-// states and nets ~0. Sign convention is preserved (00->10 == +1, the same edge
-// the old code counted +1 on), so encSign[] stays valid — see [[wheel-sync-and-encsign]].
-// Tick magnitude is ~4x the old rate, so MAX_TPS[] must be recalibrated.
-static volatile uint8_t encState[4] = { 0, 0, 0, 0 };  // last (A<<1)|B per wheel
-// Index = (oldState<<2)|newState, state=(A<<1)|B. +1 along the increment Gray
-// cycle 00->10->11->01->00, -1 reverse, 0 for no-move and illegal both-bit jumps.
-static const int8_t QTAB[16] = {
-   0, -1, +1,  0,
-  +1,  0,  0, -1,
-  -1,  0,  0, +1,
-   0, +1, -1,  0,
-};
-static inline void IRAM_ATTR encUpdate(uint8_t i) {
-  uint8_t s   = (uint8_t)((digitalRead(motors[i].encA) << 1) | digitalRead(motors[i].encB));
-  uint8_t idx = (uint8_t)((encState[i] << 2) | s);
-  encCount[i] += QTAB[idx];
-  encState[i]  = s;
-}
-static void IRAM_ATTR encISR0() { encUpdate(0); }
-static void IRAM_ATTR encISR1() { encUpdate(1); }
-static void IRAM_ATTR encISR2() { encUpdate(2); }
-static void IRAM_ATTR encISR3() { encUpdate(3); }
-static void (*encISRs[4])() = { encISR0, encISR1, encISR2, encISR3 };
+// Full 4x quadrature decode in HARDWARE: one ESP32 pulse-counter (PCNT) unit per
+// wheel, two channels each — A edges steered by B's level, B edges by A's. It
+// replaces a GPIO interrupt on every edge of both channels (BUG-008 decode,
+// 2026-06-02): ~34,000 interrupts/sec at full speed, each running two
+// digitalRead()s on the control core. PCNT counts in silicon, so there is no
+// per-edge CPU, no edge lost to interrupt latency, and its glitch filter
+// (ENC_GLITCH_NS) drops motor-current spikes at the pin. A wheel dithering one
+// channel still nets ~0, as with the old transition table.
+// Sign convention is IDENTICAL to that table (state=(A<<1)|B, +1 along
+// 00->10->11->01->00: e.g. A rising while B is low counts +1), and it is still 4
+// counts per quadrature cycle — so encSign[] and the MAX_TPS[] scale stay valid.
+// See [[wheel-sync-and-encsign]].
+// The hardware counter is 16-bit. accum_count makes the driver extend it by adding
+// ±ENC_PCNT_LIMIT in an overflow interrupt — one per ~4 s per wheel at full speed.
+static const int ENC_PCNT_LIMIT = 32000;
+static pcnt_unit_handle_t encUnit[4] = { nullptr, nullptr, nullptr, nullptr };
+static bool encReady = false;   // true once all four units are counting
 
 static bool isInputOnly(uint8_t pin) {
   return pin == 34 || pin == 35 || pin == 36 || pin == 39;
+}
+
+static bool setupEncoder(uint8_t i) {
+  const Motor& m = motors[i];
+  pinMode(m.encA, isInputOnly(m.encA) ? INPUT : INPUT_PULLUP);
+  pinMode(m.encB, isInputOnly(m.encB) ? INPUT : INPUT_PULLUP);
+
+  pcnt_unit_config_t ucfg = {};
+  ucfg.low_limit  = -ENC_PCNT_LIMIT;
+  ucfg.high_limit =  ENC_PCNT_LIMIT;
+  ucfg.flags.accum_count = 1;
+  pcnt_glitch_filter_config_t fcfg = {};
+  fcfg.max_glitch_ns = ENC_GLITCH_NS;
+  pcnt_chan_config_t acfg = {};          // counts A edges, direction from B's level
+  acfg.edge_gpio_num  = m.encA;
+  acfg.level_gpio_num = m.encB;
+  pcnt_chan_config_t bcfg = {};          // counts B edges, direction from A's level
+  bcfg.edge_gpio_num  = m.encB;
+  bcfg.level_gpio_num = m.encA;
+
+  pcnt_unit_handle_t    u   = nullptr;
+  pcnt_channel_handle_t chA = nullptr, chB = nullptr;
+  esp_err_t e = pcnt_new_unit(&ucfg, &u);
+  if (e == ESP_OK) e = pcnt_unit_set_glitch_filter(u, &fcfg);
+  if (e == ESP_OK) e = pcnt_new_channel(u, &acfg, &chA);
+  if (e == ESP_OK) e = pcnt_new_channel(u, &bcfg, &chB);
+  // A: rising = -1 while B high, inverted (+1) while B low. B: rising = +1 while A
+  // high, inverted (-1) while A low. Falling edges are the mirror image.
+  if (e == ESP_OK) e = pcnt_channel_set_edge_action(chA, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+  if (e == ESP_OK) e = pcnt_channel_set_level_action(chA, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+  if (e == ESP_OK) e = pcnt_channel_set_edge_action(chB, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+  if (e == ESP_OK) e = pcnt_channel_set_level_action(chB, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+  // The limit watch points are what arm the overflow interrupt accum_count needs.
+  if (e == ESP_OK) e = pcnt_unit_add_watch_point(u,  ENC_PCNT_LIMIT);
+  if (e == ESP_OK) e = pcnt_unit_add_watch_point(u, -ENC_PCNT_LIMIT);
+  if (e == ESP_OK) e = pcnt_unit_enable(u);
+  if (e == ESP_OK) e = pcnt_unit_clear_count(u);
+  if (e == ESP_OK) e = pcnt_unit_start(u);
+  if (e != ESP_OK) {
+    Serial.printf("encoder %u PCNT init FAILED: %s\n", i, esp_err_to_name(e));
+    return false;
+  }
+  encUnit[i] = u;
+  return true;
 }
 
 static void motorWrite(uint8_t idx, int16_t speed) {
@@ -176,17 +209,18 @@ static float lastOutPwm[4]    = { 0, 0, 0, 0 };
 static float stallMs[4]      = { 0, 0, 0, 0 };
 static bool  wheelStalled[4] = { false, false, false, false };
 
-static long readCountAtomic(uint8_t i) {
-  noInterrupts();
-  long c = encCount[i];
-  interrupts();
+// Accumulated (32-bit) encoder count. Reads 0 for a unit that failed to init;
+// encReady keeps the drive stopped in that case.
+static long readCount(uint8_t i) {
+  int c = 0;
+  if (encUnit[i]) pcnt_unit_get_count(encUnit[i], &c);
   return c;
 }
 
 static void pidReset() {
   for (int i = 0; i < 4; i++) {
     pid[i].integral  = 0.0f;
-    pid[i].lastCount = readCountAtomic(i);
+    pid[i].lastCount = readCount(i);
     curCmd[i]        = 0;     // drop the slew ramp so resume starts from rest
     lastOutPwm[i]    = 0.0f;  // output slew restarts from zero too
     stallMs[i]       = 0.0f;
@@ -212,7 +246,7 @@ static inline float limitPwm(float desired, float prevOut, float dt) {
 static void pidStep(const int32_t cmd[4], float dt) {
   for (int i = 0; i < 4; i++) {
     // Signed encoder delta (apply sign to fix wiring inversions).
-    long now   = readCountAtomic(i);
+    long now   = readCount(i);
     long delta = now - pid[i].lastCount;
     pid[i].lastCount = now;
 
@@ -221,7 +255,8 @@ static void pidStep(const int32_t cmd[4], float dt) {
     // it so the loop tracks real motion, not the spike. Without this, inrush
     // noise spikes the velocity estimate, the PID slams PWM to react, and the
     // current swing makes more noise — a self-sustaining limit cycle (worst on
-    // vx+, all 4 motors inrushing forward together).
+    // vx+, all 4 motors inrushing forward together). The PCNT glitch filter now
+    // drops most of that noise at the pin; this clamp stays as the backstop.
     long maxDelta = (long)(MAX_TPS[i] * 1.5f * dt) + 2;
     if (delta >  maxDelta) delta =  maxDelta;
     if (delta < -maxDelta) delta = -maxDelta;
@@ -395,14 +430,12 @@ static void handleCommand(char* line) {
       Serial.println("OK s");
       break;
     case 'r':
-      noInterrupts();
-      for (int i = 0; i < 4; i++) encCount[i] = 0;
-      interrupts();
+      for (int i = 0; i < 4; i++) if (encUnit[i]) pcnt_unit_clear_count(encUnit[i]);
       pidReset();
       // Baseline telemetry from the post-zero counts (not a hard 0) so the first
-      // TLM delta after `r` doesn't show a phantom velocity from ISR ticks that
+      // TLM delta after `r` doesn't show a phantom velocity from counts that
       // landed between the zeroing and pidReset.
-      for (int i = 0; i < 4; i++) prevEnc[i] = readCountAtomic(i);
+      for (int i = 0; i < 4; i++) prevEnc[i] = readCount(i);
       Serial.println("OK r");
       break;
     case 'x':
@@ -492,7 +525,7 @@ static void emitTlm(uint32_t now) {
   float dt = dt_ms / 1000.0f;
   long cnt[4], delta[4];
   for (int i = 0; i < 4; i++) {
-    cnt[i]    = readCountAtomic(i);
+    cnt[i]    = readCount(i);
     delta[i]  = cnt[i] - prevEnc[i];
     prevEnc[i] = cnt[i];
   }
@@ -613,15 +646,12 @@ void setup() {
     digitalWrite(m.inB, LOW);
     ledcAttach(m.pwm, PWM_FREQ, PWM_RES);
     ledcWrite(m.pwm, 0);
-    pinMode(m.encA, isInputOnly(m.encA) ? INPUT : INPUT_PULLUP);
-    pinMode(m.encB, isInputOnly(m.encB) ? INPUT : INPUT_PULLUP);
-    // 4x quadrature: seed the state from the rest level, then fire on every edge
-    // of BOTH channels. Both pins share one ISR per wheel; same-core GPIO ISRs
-    // serialize, so encState[i] needs no extra guard.
-    encState[i] = (uint8_t)((digitalRead(m.encA) << 1) | digitalRead(m.encB));
-    attachInterrupt(digitalPinToInterrupt(m.encA), encISRs[i], CHANGE);
-    attachInterrupt(digitalPinToInterrupt(m.encB), encISRs[i], CHANGE);
   }
+
+  // All four encoders must come up: a wheel that reads 0 ticks would be driven to
+  // full PWM by its PI loop. loop() holds the motors stopped while encReady is false.
+  encReady = true;
+  for (uint8_t i = 0; i < 4; i++) encReady = setupEncoder(i) && encReady;
 
   setupEspNow();
   pidReset();
@@ -643,6 +673,11 @@ void loop() {
   if (!espNowReady && now - lastEspWarnMs >= 1000) {
     lastEspWarnMs = now;
     Serial.println("WARN ESP-NOW init failed — no radio link (motors held stopped)");
+  }
+  static uint32_t lastEncWarnMs = 0;
+  if (!encReady && now - lastEncWarnMs >= 1000) {
+    lastEncWarnMs = now;
+    Serial.println("WARN encoder PCNT init failed — drive disabled (motors held stopped)");
   }
 
   if (now - lastDriveMs >= 10) {
@@ -666,7 +701,7 @@ void loop() {
     age = now - lastPacketMs;
     portEXIT_CRITICAL(&pktMux);
 
-    if (age > WATCHDOG_MS || (p.flags & 0x01)) {
+    if (!encReady || age > WATCHDOG_MS || (p.flags & 0x01)) {
       if (!wasStopped) { motorStopAll(); pidReset(); wasStopped = true; }
     } else if (testMode && testSrc == TS_DIRECT) {
       for (int i = 0; i < 4; i++) {
@@ -693,7 +728,7 @@ void loop() {
       // stale. Re-baseline it to the current count so the first velocity estimate
       // spans one tick, not the whole stopped interval (no recovery lurch).
       if (wasStopped) {
-        for (int i = 0; i < 4; i++) pid[i].lastCount = readCountAtomic(i);
+        for (int i = 0; i < 4; i++) pid[i].lastCount = readCount(i);
         // (BUG-012) Resume conservatively, not at full authority. pidReset() left
         // govScale=1.0; starting the post-watchdog ramp ungoverned means the first
         // ticks command a full mecanumMix with no cross-wheel protection (a surge/

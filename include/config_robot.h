@@ -10,6 +10,13 @@ static const int PWM_RES  = 10;
 static const int PWM_MAX  = (1 << PWM_RES) - 1;   // 1023
 static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed PWM
 
+// Encoder input glitch filter (PCNT hardware): a pulse shorter than this never
+// reaches the counter. At full speed each encoder channel's pulse is ~230 us wide
+// (MAX_TPS ~8700 edges/s = 4 edges per 460 us cycle); motor-switching spikes are a
+// few us. The ESP32 filter tops out at ~12.7 us (1023 APB cycles), so setting this
+// higher makes encoder init fail and the robot refuse to drive.
+static const uint32_t ENC_GLITCH_NS = 10000;
+
 // Velocity control
 // Per-wheel full-PWM tick rate (ticks/sec) — slot order [FL,FR,RL,RR].
 // 4x quadrature decode (BUG-008 fixed): every A/B edge counts, so the tick rate
