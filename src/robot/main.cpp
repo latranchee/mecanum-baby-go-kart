@@ -201,6 +201,13 @@ static void pidReset() {
   lastBodyCorr[0] = lastBodyCorr[1] = lastBodyCorr[2] = 0.0f;
 }
 
+// The actuator dynamics every pidStep branch shares: ±PWM_MAX clamp + PWM_SLEW from
+// the last delivered output. Thin wrapper binds the tuning constants (clampSlew is
+// the host-tested logic in control_math.h).
+static inline float limitPwm(float desired, float prevOut, float dt) {
+  return clampSlew(desired, prevOut, (float)PWM_MAX, PWM_SLEW * dt);
+}
+
 // cmd[i] in [-1000..+1000]; dt in seconds.
 static void pidStep(const int32_t cmd[4], float dt) {
   for (int i = 0; i < 4; i++) {
@@ -239,11 +246,7 @@ static void pidStep(const int32_t cmd[4], float dt) {
       // thrust the governor/body loop then read as yaw. A fast decay still clears on
       // a real stop (sub-tick over ~50ms) but does not slam a momentary zero-cross.
       pid[i].integral *= 0.5f;
-      float prevOut    = lastOutPwm[i];
-      float maxPwmStep = PWM_SLEW * dt;
-      float out        = 0.0f;
-      if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
-      if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+      float out = limitPwm(0.0f, lastOutPwm[i], dt);
       motorWrite(i, (int16_t)lroundf(out));
       stallMs[i]       = 0.0f;
       wheelStalled[i]  = false;
@@ -274,13 +277,7 @@ static void pidStep(const int32_t cmd[4], float dt) {
     // during an A/B. Apply the SAME actuator dynamics as the PI path (PWM_MAX
     // clamp + PWM_SLEW) so only the control law differs, not the actuator.
     if (!enableClosedLoop) {
-      float prevOut    = lastOutPwm[i];
-      float maxPwmStep = PWM_SLEW * dt;
-      float out        = kff * targetTps;
-      if (out >  PWM_MAX) out =  PWM_MAX;
-      if (out < -PWM_MAX) out = -PWM_MAX;
-      if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
-      if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+      float out = limitPwm(kff * targetTps, lastOutPwm[i], dt);
       pid[i].integral  = 0.0f;            // clean re-enable (no stale windup)
       motorWrite(i, (int16_t)lroundf(out));
       lastTargetTps[i] = targetTps;
@@ -294,17 +291,8 @@ static void pidStep(const int32_t cmd[4], float dt) {
     // Compute the desired output from the CURRENT integral, then apply BOTH
     // actuator limits — the hard PWM_MAX clamp and the per-tick slew limiter —
     // to get the value actually delivered this tick.
-    float prevOut    = lastOutPwm[i];
-    float maxPwmStep = PWM_SLEW * dt;
-    float desired    = kff * targetTps + Kp * err + pid[i].integral;
-
-    float out = desired;
-    if (out >  PWM_MAX) out =  PWM_MAX;
-    if (out < -PWM_MAX) out = -PWM_MAX;
-    // Output slew-rate limit: cap per-tick PWM change so the loop can't slam
-    // the motor rail-to-rail (kills the rotate-start oscillation).
-    if (out > prevOut + maxPwmStep) out = prevOut + maxPwmStep;
-    if (out < prevOut - maxPwmStep) out = prevOut - maxPwmStep;
+    float desired = kff * targetTps + Kp * err + pid[i].integral;
+    float out     = limitPwm(desired, lastOutPwm[i], dt);
 
     // Conditional-integration anti-windup: integrate only when the actuator is
     // NOT limited in the direction the error would push it. This now covers the
@@ -474,6 +462,28 @@ static void pollSerial() {
   }
 }
 
+// Control-state fields shared by the TLM stream and the 2 Hz status line, built
+// once so the two can't drift apart. tools/tlm.py reads them by field name.
+static void fmtCtrlState(char* buf, size_t n, const CtrlPacket& p) {
+  int32_t cmd[4];
+  mecanumMix(p.vx, p.vy, p.omega, cmd);
+  snprintf(buf, n,
+           "cmd=[%ld %ld %ld %ld] gov=%.2f en=[%d %d %d] body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f]",
+           (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
+           govScale,
+           enableGovernor, enableClosedLoop, enableBodyLoop,
+           bodyVxF, bodyVyF, bodyWF, bodySF,
+           lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
+           lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3]);
+}
+
+// " vbat=12.34", or empty when no sensing is wired.
+static void fmtBatt(char* buf, size_t n) {
+  buf[0] = '\0';
+  float vb = readBattVolts();
+  if (vb >= 0) snprintf(buf, n, " vbat=%.2f", vb);
+}
+
 static void emitTlm(uint32_t now) {
   // Skip a same-millisecond re-entry: dividing by a 1 ms floor inflates raw_tps
   // ~50x and shows a phantom spike on the readout used to diagnose stalls.
@@ -490,21 +500,12 @@ static void emitTlm(uint32_t now) {
 
   CtrlPacket p;
   getPacketSnapshot(p);
-  int32_t cmd[4];
-  mecanumMix(p.vx, p.vy, p.omega, cmd);
+  char state[192], batt[24];
+  fmtCtrlState(state, sizeof(state), p);
+  fmtBatt(batt, sizeof(batt));
 
-  char batt[24] = "";
-  float vb = readBattVolts();
-  if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
-
-  Serial.printf("TLM ms=%lu cmd=[%ld %ld %ld %ld] gov=%.2f en=[%d %d %d] body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
-                (unsigned long)now,
-                (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
-                govScale,
-                enableGovernor, enableClosedLoop, enableBodyLoop,
-                bodyVxF, bodyVyF, bodyWF, bodySF,
-                lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
-                lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
+  Serial.printf("TLM ms=%lu %s raw_tps=[%.1f %.1f %.1f %.1f] cnt=[%ld %ld %ld %ld]%s\n",
+                (unsigned long)now, state,
                 (float)delta[0]/dt, (float)delta[1]/dt, (float)delta[2]/dt, (float)delta[3]/dt,
                 cnt[0], cnt[1], cnt[2], cnt[3], batt);
 }
@@ -826,23 +827,15 @@ void loop() {
     age = now - lastPacketMs;
     portEXIT_CRITICAL(&pktMux);
     bool fresh = age < 500 && p.seq != lastSeen;
-    int32_t cmd[4];
-    mecanumMix(p.vx, p.vy, p.omega, cmd);
-    char batt[24] = "";
-    float vb = readBattVolts();
-    if (vb >= 0) snprintf(batt, sizeof(batt), " vbat=%.2f", vb);
+    char state[192], batt[24];
+    fmtCtrlState(state, sizeof(state), p);
+    fmtBatt(batt, sizeof(batt));
     char stall[20] = "";
     if (wheelStalled[0] || wheelStalled[1] || wheelStalled[2] || wheelStalled[3])
       snprintf(stall, sizeof(stall), " STALL=[%d %d %d %d]",
                wheelStalled[0], wheelStalled[1], wheelStalled[2], wheelStalled[3]);
-    Serial.printf("seq=%lu vx=%d vy=%d w=%d | cmd=[%ld %ld %ld %ld] gov=%.2f en=[%d %d %d] body=[%.0f %.0f %.0f] s=%.0f corr=[%.0f %.0f %.0f] pwm=[%.0f %.0f %.0f %.0f] meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s%s\n",
-                  (unsigned long)p.seq, p.vx, p.vy, p.omega,
-                  (long)cmd[0], (long)cmd[1], (long)cmd[2], (long)cmd[3],
-                  govScale,
-                  enableGovernor, enableClosedLoop, enableBodyLoop,
-                  bodyVxF, bodyVyF, bodyWF, bodySF,
-                  lastBodyCorr[0], lastBodyCorr[1], lastBodyCorr[2],
-                  lastOutPwm[0], lastOutPwm[1], lastOutPwm[2], lastOutPwm[3],
+    Serial.printf("seq=%lu vx=%d vy=%d w=%d | %s meas=[%.0f %.0f %.0f %.0f] crcDrops=%lu%s%s%s\n",
+                  (unsigned long)p.seq, p.vx, p.vy, p.omega, state,
                   lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
                   (unsigned long)crcDrops, batt, stall,
                   fresh ? "" : " (stale)");

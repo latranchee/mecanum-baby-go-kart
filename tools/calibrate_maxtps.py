@@ -14,7 +14,6 @@ Pairs with the test-mode block in src/robot/main.cpp (commands m/s/r/x).
 from __future__ import annotations
 
 import argparse
-import re
 import statistics
 import sys
 import time
@@ -25,11 +24,7 @@ except ImportError:
     sys.stderr.write("error: pyserial not installed. run: pip install pyserial\n")
     sys.exit(1)
 
-# TLM lines carry extra fields (gov=, batt) in varying positions, so anchor only
-# on raw_tps[] and search rather than match the whole line.
-TLM_RE = re.compile(
-    r"raw_tps=\[(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\]"
-)
+from tlm import parse_tlm
 
 SLOTS = ["FL", "FR", "RL", "RR"]
 
@@ -59,12 +54,12 @@ def measure(ser, slot, pwm, spin_s, settle_s):
     samples = []
     t0 = time.monotonic()
     for line in read_lines(ser, spin_s):
-        m = TLM_RE.search(line.strip())
-        if not m:
+        s = parse_tlm(line)
+        if s is None:
             continue
         if time.monotonic() - t0 < settle_s:   # skip spin-up transient
             continue
-        samples.append(abs(float(m.group(slot + 1))))
+        samples.append(abs(s.raw_tps[slot]))
     ser.write(b"s\n"); ser.flush(); time.sleep(0.4)
     if not samples:
         return 0.0, 0
@@ -91,9 +86,9 @@ def main() -> int:
     ser.write(b"s\n"); ser.flush()           # enter test mode, all stopped
     time.sleep(0.3)
     # Confirm we're actually in test mode (TLM streaming) before driving.
-    if not any(TLM_RE.search(l.strip()) for l in read_lines(ser, 1.0)):
+    if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
         ser.write(b"s\n"); ser.flush(); time.sleep(0.3)
-        if not any(TLM_RE.search(l.strip()) for l in read_lines(ser, 1.0)):
+        if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
             sys.stderr.write("error: no TLM stream — robot not in test mode. Check port/boot.\n")
             ser.close(); return 3
 

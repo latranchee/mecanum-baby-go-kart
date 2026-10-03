@@ -7,7 +7,8 @@ import argparse, queue, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from joyctl import SerialIO, parse_tlm  # type: ignore
+from joyctl import SerialIO  # type: ignore
+from tlm import parse_tlm  # type: ignore
 
 
 def main():

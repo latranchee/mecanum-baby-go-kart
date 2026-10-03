@@ -581,6 +581,28 @@ static void test_normalize_clamps(void) {
   TEST_ASSERT_EQUAL_INT16(-1000, normalize(0, 4000, DEADZONE_RAW, HALF_RANGE));
 }
 
+// ---------------- clampSlew (PWM actuator limit) ----------------
+
+static void test_clamp_slew_passes_reachable_target(void) {
+  // Inside both limits the request is delivered EXACTLY — the anti-windup test in
+  // pidStep compares out to desired, so no rounding may creep in here.
+  TEST_ASSERT_EQUAL_FLOAT(412.5f, clampSlew(412.5f, 400.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-90.0f, clampSlew(-90.0f, -100.0f, 1023.0f, 25.0f));
+}
+
+static void test_clamp_slew_caps_step_both_ways(void) {
+  TEST_ASSERT_EQUAL_FLOAT( 25.0f, clampSlew( 900.0f, 0.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-25.0f, clampSlew(-900.0f, 0.0f, 1023.0f, 25.0f));
+  // Ramp-to-idle from full: one slew step down, not a slam to 0.
+  TEST_ASSERT_EQUAL_FLOAT(998.0f, clampSlew(0.0f, 1023.0f, 1023.0f, 25.0f));
+}
+
+static void test_clamp_slew_hard_limit_wins(void) {
+  // Request beyond the rail, slew wide open: the ±limit clamp bounds it.
+  TEST_ASSERT_EQUAL_FLOAT( 1023.0f, clampSlew( 5000.0f,  1020.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-1023.0f, clampSlew(-5000.0f, -1020.0f, 1023.0f, 25.0f));
+}
+
 // ---------------- crc8 ----------------
 
 static void test_crc8_known_vector(void) {
@@ -675,6 +697,9 @@ int main(void) {
   RUN_TEST(test_normalize_deadband_zero);
   RUN_TEST(test_normalize_full_deflection);
   RUN_TEST(test_normalize_clamps);
+  RUN_TEST(test_clamp_slew_passes_reachable_target);
+  RUN_TEST(test_clamp_slew_caps_step_both_ways);
+  RUN_TEST(test_clamp_slew_hard_limit_wins);
   RUN_TEST(test_crc8_known_vector);
   RUN_TEST(test_crc8_detects_corruption);
   RUN_TEST(test_packet_wire_size);

@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import queue
-import re
 import statistics
 import sys
 import threading
@@ -30,54 +28,7 @@ except ImportError:
     sys.stderr.write("error: pyserial not installed. run: pip install pyserial\n")
     sys.exit(1)
 
-
-TLM_RE = re.compile(
-    r"^TLM\s+ms=(\d+)\s+"
-    r"cmd=\[(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\]\s+"
-    r"pwm=\[(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\]\s+"
-    r"raw_tps=\[(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\]\s+"
-    r"cnt=\[(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\]"
-)
-
-
-@dataclass
-class TlmSample:
-    ms: int
-    cmd: list[int]
-    pwm: list[float]
-    raw_tps: list[float]
-    cnt: list[int]
-
-    def as_csv_row(self) -> list[str]:
-        out: list[str] = [str(self.ms)]
-        out += [str(v) for v in self.cmd]
-        out += [f"{v:.0f}" for v in self.pwm]
-        out += [f"{v:.1f}" for v in self.raw_tps]
-        out += [str(v) for v in self.cnt]
-        return out
-
-
-def parse_tlm(line: str) -> Optional[TlmSample]:
-    m = TLM_RE.match(line.strip())
-    if not m:
-        return None
-    g = m.groups()
-    return TlmSample(
-        ms=int(g[0]),
-        cmd=[int(g[1]), int(g[2]), int(g[3]), int(g[4])],
-        pwm=[float(g[5]), float(g[6]), float(g[7]), float(g[8])],
-        raw_tps=[float(g[9]), float(g[10]), float(g[11]), float(g[12])],
-        cnt=[int(g[13]), int(g[14]), int(g[15]), int(g[16])],
-    )
-
-
-CSV_HEADER = (
-    ["ms"]
-    + [f"cmd{i}" for i in range(4)]
-    + [f"pwm{i}" for i in range(4)]
-    + [f"raw_tps{i}" for i in range(4)]
-    + [f"cnt{i}" for i in range(4)]
-)
+from tlm import CSV_HEADER, TlmSample, parse_tlm
 
 
 class SerialIO:

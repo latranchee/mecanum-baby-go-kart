@@ -20,6 +20,18 @@ static inline int16_t normalize(uint16_t raw, uint16_t center,
   return (int16_t)clampI32(out, -1000, 1000);
 }
 
+// Actuator limit: hard ±limit clamp, then a slew cap of maxStep away from the last
+// delivered value `prev`. The slew is what keeps a loop from slamming the motor
+// rail-to-rail (it killed the rotate-start oscillation).
+static inline float clampSlew(float desired, float prev, float limit, float maxStep) {
+  float out = desired;
+  if (out >  limit) out =  limit;
+  if (out < -limit) out = -limit;
+  if (out > prev + maxStep) out = prev + maxStep;
+  if (out < prev - maxStep) out = prev - maxStep;
+  return out;
+}
+
 // CRC-8/SMBUS (poly 0x07, init 0x00, no reflection, xorout 0x00).
 // Check value: crc8("123456789", 9) == 0xF4. Used for CtrlPacket integrity (#4).
 static inline uint8_t crc8(const uint8_t* data, size_t len) {
