@@ -72,6 +72,81 @@ static void test_normalize_quad_under_limit_untouched(void) {
   TEST_ASSERT_EQUAL_INT32(0,    c[3]);
 }
 
+// ---------------- mixInverse / slewQuad ----------------
+
+static void test_mix_inverse_roundtrip_unsaturated(void) {
+  int32_t c[4];
+  mecanumMix(300, -200, 150, c);
+  int32_t vx, vy, w;
+  mixInverse(c, &vx, &vy, &w);
+  TEST_ASSERT_EQUAL_INT32(300, vx);
+  TEST_ASSERT_EQUAL_INT32(-200, vy);
+  TEST_ASSERT_EQUAL_INT32(150, w);
+}
+
+static void test_mix_inverse_reports_normalized_twist(void) {
+  // Forward 1000 + turn 300 saturates the mix: the wheels express (769, 0, 231),
+  // which is what the outer loops must judge against, not the packet (1000, 0, 300).
+  int32_t c[4];
+  mecanumMix(1000, 0, 300, c);
+  int32_t vx, vy, w;
+  mixInverse(c, &vx, &vy, &w);
+  TEST_ASSERT_INT32_WITHIN(1, 769, vx);
+  TEST_ASSERT_INT32_WITHIN(1, 0, vy);
+  TEST_ASSERT_INT32_WITHIN(1, 231, w);
+}
+
+static void test_slew_quad_keeps_twist_direction(void) {
+  // Forward+turn from rest. Every step of the ramp must keep omega/vx at the target
+  // ratio; the old per-wheel clamp drove dead straight for the first ~300 ms.
+  int32_t tgt[4];
+  mecanumMix(800, 0, 300, tgt);
+  int32_t tvx, tvy, tw;
+  mixInverse(tgt, &tvx, &tvy, &tw);
+  const float want = (float)tw / (float)tvx;
+  int32_t cur[4] = { 0, 0, 0, 0 };
+  for (int k = 0; k < 100; k++) {
+    slewQuad(cur, tgt, 15);
+    int32_t vx, vy, w;
+    mixInverse(cur, &vx, &vy, &w);
+    if (vx > 50) TEST_ASSERT_FLOAT_WITHIN(0.03f, want, (float)w / (float)vx);
+  }
+  TEST_ASSERT_EQUAL_INT32_ARRAY(tgt, cur, 4);   // arrives exactly
+}
+
+static void test_slew_quad_caps_every_wheel_step(void) {
+  // The inrush cap is unchanged: no wheel ever steps more than maxStep, and the
+  // wheel with the largest remaining change steps exactly maxStep until arrival.
+  int32_t tgt[4] = { 1000, -400, 250, -1000 };
+  int32_t cur[4] = { -200,  300,   0,   500 };
+  for (int k = 0; k < 200; k++) {
+    int32_t prev[4] = { cur[0], cur[1], cur[2], cur[3] };
+    int32_t big = 0;
+    for (int i = 0; i < 4; i++) {
+      int32_t a = tgt[i] - prev[i];
+      if (a < 0) a = -a;
+      if (a > big) big = a;
+    }
+    slewQuad(cur, tgt, 15);
+    int32_t maxMoved = 0;
+    for (int i = 0; i < 4; i++) {
+      int32_t a = cur[i] - prev[i];
+      if (a < 0) a = -a;
+      TEST_ASSERT_TRUE(a <= 15);
+      if (a > maxMoved) maxMoved = a;
+    }
+    if (big > 15) TEST_ASSERT_EQUAL_INT32(15, maxMoved);
+  }
+  TEST_ASSERT_EQUAL_INT32_ARRAY(tgt, cur, 4);
+}
+
+static void test_slew_quad_snaps_within_one_step(void) {
+  int32_t tgt[4] = { 100, 104, 96, 110 };
+  int32_t cur[4] = { 95, 100, 100, 100 };   // largest change 10 <= 15
+  slewQuad(cur, tgt, 15);
+  TEST_ASSERT_EQUAL_INT32_ARRAY(tgt, cur, 4);
+}
+
 // ---------------- speedGovernorScale (cross-wheel sync) ----------------
 // Signature: (cmd, meas, outPwm, refTps, pwmMax, loScale, satFrac, valid).
 // refTps = uniform target reference (weakest wheel's max). 2100 here. pwmMax=1023.
@@ -514,6 +589,36 @@ static void test_body_frozen_integral_decays(void) {
   TEST_ASSERT_TRUE(bl_abs(st.iw) < bl_abs(wound) * 0.5f);   // decayed substantially
 }
 
+static void test_body_ref_decoded_mix_no_standing_correction(void) {
+  // Forward 1000 + turn 300 (past mix saturation), wheels tracking perfectly.
+  // Judged against the twist the wheels were actually given (mixInverse, the
+  // fixed call site), the loop has nothing to correct. Judged against the raw
+  // packet (the old call site) it pins a forward correction the wheels can never
+  // close, which the renormalize then pays for out of the turn.
+  int32_t c[4];
+  mecanumMix(1000, 0, 300, c);
+  int32_t bvx, bvy, bw;
+  mixInverse(c, &bvx, &bvy, &bw);
+  float meas[4] = { (float)c[0], (float)c[1], (float)c[2], (float)c[3] };  // cmd units
+  float vx_m, vy_m, w_m, s_m;
+  forwardKinematics(meas, 1000.0f, &vx_m, &vy_m, &w_m, &s_m);
+
+  BodyLoopCfg cfg = body_cfg();
+  cfg.wThresh = BODY_W_THRESH;
+  float dvx, dvy, dw;
+  BodyLoopState fixed = {};
+  body_settle(&fixed, &cfg, (float)bvx, (float)bvy, (float)bw, vx_m, vy_m, w_m,
+              false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 0.0f, dvx);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 0.0f, dvy);
+  TEST_ASSERT_FLOAT_WITHIN(1.0f, 0.0f, dw);
+
+  BodyLoopState old = {};
+  body_settle(&old, &cfg, 1000.0f, 0.0f, 300.0f, vx_m, vy_m, w_m,
+              false, 1.0f, &dvx, &dvy, &dw);
+  TEST_ASSERT_TRUE(dvx > 20.0f);   // the standing correction the fix removes
+}
+
 // ---------------- applyCurve ----------------
 
 static void test_curve_zero_and_deadzone(void) {
@@ -581,6 +686,42 @@ static void test_normalize_clamps(void) {
   TEST_ASSERT_EQUAL_INT16(-1000, normalize(0, 4000, DEADZONE_RAW, HALF_RANGE));
 }
 
+// ---------------- clampSlew (PWM actuator limit) ----------------
+
+static void test_clamp_slew_passes_reachable_target(void) {
+  // Inside both limits the request is delivered EXACTLY — the anti-windup test in
+  // pidStep compares out to desired, so no rounding may creep in here.
+  TEST_ASSERT_EQUAL_FLOAT(412.5f, clampSlew(412.5f, 400.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-90.0f, clampSlew(-90.0f, -100.0f, 1023.0f, 25.0f));
+}
+
+static void test_clamp_slew_caps_step_both_ways(void) {
+  TEST_ASSERT_EQUAL_FLOAT( 25.0f, clampSlew( 900.0f, 0.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-25.0f, clampSlew(-900.0f, 0.0f, 1023.0f, 25.0f));
+  // Ramp-to-idle from full: one slew step down, not a slam to 0.
+  TEST_ASSERT_EQUAL_FLOAT(998.0f, clampSlew(0.0f, 1023.0f, 1023.0f, 25.0f));
+}
+
+static void test_clamp_slew_hard_limit_wins(void) {
+  // Request beyond the rail, slew wide open: the ±limit clamp bounds it.
+  TEST_ASSERT_EQUAL_FLOAT( 1023.0f, clampSlew( 5000.0f,  1020.0f, 1023.0f, 25.0f));
+  TEST_ASSERT_EQUAL_FLOAT(-1023.0f, clampSlew(-5000.0f, -1020.0f, 1023.0f, 25.0f));
+}
+
+// ---------------- speed reference headroom ----------------
+
+static void test_full_cmd_feedforward_headroom(void) {
+  // cmd 1000 feed-forward ALONE must sit under the governor's saturation gate on
+  // every wheel, with margin. Otherwise full stick reads "saturated" at no load:
+  // the body loop freezes itself and the PI has no PWM left for a lagging wheel.
+  // Trips if SPEED_REF_FRAC is raised or MAX_TPS[] is recalibrated far apart.
+  const float gate = (GOV_SAT_FRAC - 0.03f) * (float)PWM_MAX;
+  for (int i = 0; i < 4; i++) {
+    float ff = (float)PWM_MAX / MAX_TPS[i] * cmdRefTps();
+    TEST_ASSERT_TRUE(ff < gate);
+  }
+}
+
 // ---------------- crc8 ----------------
 
 static void test_crc8_known_vector(void) {
@@ -603,6 +744,22 @@ static void test_packet_wire_size(void) {
   TEST_ASSERT_EQUAL_UINT32(13, (uint32_t)sizeof(CtrlPacket));
 }
 
+static void test_ctrl_flags_from_preset(void) {
+  // FULL preset (no disable bits, no estop) MUST be 0 — the legacy-safe value a
+  // headset or un-updated sender emits, meaning "all features ON".
+  TEST_ASSERT_EQUAL_UINT8(0, ctrlFlagsFromPreset(0, false));
+  // Disable bits pass through verbatim.
+  TEST_ASSERT_EQUAL_UINT8(CTRL_FLAG_GOV_OFF, ctrlFlagsFromPreset(CTRL_FLAG_GOV_OFF, false));
+  // RAW preset: all three feature bits set, no estop.
+  uint8_t raw = CTRL_FLAG_GOV_OFF | CTRL_FLAG_CL_OFF | CTRL_FLAG_BODY_OFF;
+  TEST_ASSERT_EQUAL_UINT8(raw, ctrlFlagsFromPreset(raw, false));
+  // estop ORs in bit0 alongside the disable bits, never disturbing them.
+  TEST_ASSERT_EQUAL_UINT8((uint8_t)(raw | CTRL_FLAG_ESTOP), ctrlFlagsFromPreset(raw, true));
+  TEST_ASSERT_EQUAL_UINT8(CTRL_FLAG_ESTOP, ctrlFlagsFromPreset(0, true));
+  // estop bit in the disableBits arg is masked out (only the *_OFF bits are kept).
+  TEST_ASSERT_EQUAL_UINT8(0, ctrlFlagsFromPreset(CTRL_FLAG_ESTOP, false));
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -614,6 +771,11 @@ int main(void) {
   RUN_TEST(test_mix_saturation_caps_at_1000);
   RUN_TEST(test_normalize_quad_scales_over_limit);
   RUN_TEST(test_normalize_quad_under_limit_untouched);
+  RUN_TEST(test_mix_inverse_roundtrip_unsaturated);
+  RUN_TEST(test_mix_inverse_reports_normalized_twist);
+  RUN_TEST(test_slew_quad_keeps_twist_direction);
+  RUN_TEST(test_slew_quad_caps_every_wheel_step);
+  RUN_TEST(test_slew_quad_snaps_within_one_step);
   RUN_TEST(test_gov_all_tracking_no_scale);
   RUN_TEST(test_gov_held_wheel_pulls_group_to_floor);
   RUN_TEST(test_gov_forward_reverse_symmetric_held_wheel);
@@ -649,6 +811,7 @@ int main(void) {
   RUN_TEST(test_body_yaw_clamped_relative_to_throttled_forward);
   RUN_TEST(test_body_freeze_drops_proportional_yaw);
   RUN_TEST(test_body_frozen_integral_decays);
+  RUN_TEST(test_body_ref_decoded_mix_no_standing_correction);
   RUN_TEST(test_curve_zero_and_deadzone);
   RUN_TEST(test_curve_sign_preserved);
   RUN_TEST(test_curve_monotonic);
@@ -659,8 +822,13 @@ int main(void) {
   RUN_TEST(test_normalize_deadband_zero);
   RUN_TEST(test_normalize_full_deflection);
   RUN_TEST(test_normalize_clamps);
+  RUN_TEST(test_clamp_slew_passes_reachable_target);
+  RUN_TEST(test_clamp_slew_caps_step_both_ways);
+  RUN_TEST(test_clamp_slew_hard_limit_wins);
+  RUN_TEST(test_full_cmd_feedforward_headroom);
   RUN_TEST(test_crc8_known_vector);
   RUN_TEST(test_crc8_detects_corruption);
   RUN_TEST(test_packet_wire_size);
+  RUN_TEST(test_ctrl_flags_from_preset);
   return UNITY_END();
 }

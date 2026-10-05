@@ -23,10 +23,13 @@ jobs:
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-${{ runner.os }}-
 
+      # Pinned to the version used locally; bump deliberately.
       - name: Install PlatformIO
-        run: pip install --upgrade platformio
+        run: pip install platformio==6.1.19
 
-      # Pure-logic host tests (kinematics, curve, normalize, crc8, packet size).
+      # Pure-logic host tests: test_math (kinematics, governor, body loop, curve,
+      # crc8, packet size) and test_safety (link gate, drive fault, stick calibration,
+      # arming, mode-click gesture).
       - name: Host unit tests
         run: pio test -e native
 

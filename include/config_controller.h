@@ -10,6 +10,23 @@ static const int32_t  HALF_RANGE   = 2000;   // raw counts from center to full d
 static const uint8_t  SPEED_STEP   = 10;     // speed % increment per button press
 static const uint32_t SEND_INTERVAL_MS = 20; // ~50Hz send rate
 
+// Stick centre calibration (controller_logic.h stickCalAdd). CAL_SAMPLES readings
+// (one per send tick, ~320 ms) must average within CENTER_TOL raw counts of
+// mid-scale and move less than CENTER_SPREAD, or the set is rejected and retried.
+// Full deflection is ~HALF_RANGE (2000) counts from centre, so a stick held even
+// halfway at power-on is refused. A healthy stick rests within a few dozen counts.
+static const uint16_t CENTER_NOMINAL = 2048;
+static const uint16_t CENTER_TOL     = 400;
+static const uint16_t CENTER_SPREAD  = 60;
+static const uint8_t  CAL_SAMPLES    = 16;
+
+// Joystick bus (I2C) health. After JOY_FAIL_TRIP consecutive failed reads (~100 ms)
+// the controller shows JOY ERR, disarms and sends e-stop frames (faster than the
+// robot's 500 ms watchdog). Every JOY_REINIT_MS it re-initializes Wire1 to recover
+// a wedged bus.
+static const uint16_t JOY_FAIL_TRIP  = 5;
+static const uint32_t JOY_REINIT_MS  = 500;
+
 // Axis inversion toggles. Flip per-axis if joystick orientation is reversed
 // relative to robot frame (e.g. controller mounted backwards).
 static const bool INVERT_VX    = true;   // front <-> back

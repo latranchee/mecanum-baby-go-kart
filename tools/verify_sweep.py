@@ -1,7 +1,13 @@
 import csv, statistics, sys
 from pathlib import Path
 
-ENC_SIGN = [-1, +1, -1, +1]  # mirrors src/robot/main.cpp encSign[]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tlm import robot_config  # type: ignore
+
+# Read from the firmware sources (src/robot/main.cpp encSign[], config_robot.h
+# MAX_TPS[] / SPEED_REF_FRAC) so a recalibration can't leave a stale copy here.
+_CFG = robot_config()
+ENC_SIGN = _CFG.enc_sign
 EXPECTED = {
     'vx+':    [+1, +1, +1, +1],
     'vx-':    [-1, -1, -1, -1],
@@ -10,7 +16,8 @@ EXPECTED = {
     'omega+': [-1, +1, -1, +1],
     'omega-': [+1, -1, +1, -1],
 }
-TARGET_MAG = 0.4 * 2100  # 840
+# cmd 1000 targets SPEED_REF_FRAC * min(MAX_TPS) (firmware cmdRefTps()).
+TARGET_MAG = 0.4 * _CFG.ref_tps  # sweep stimuli are cmd 400
 MAG_TOL = 0.4
 
 def steady_state(csv_path):

@@ -3,16 +3,36 @@
 
 // ESP-NOW packet: controller -> robot
 // Send rate ~50Hz. Robot watchdog stops motors if no packet for 500ms.
-// Robot drops frames whose seq is not newer (dedup) or whose crc8 mismatches.
+// Robot drops frames whose crc8 mismatches, frames from a second transmitter while
+// the link is live, and frames whose seq is not newer (dedup). After 500 ms of
+// silence it accepts the next valid frame from anyone (safety.h linkGateCheck).
 struct __attribute__((packed)) CtrlPacket {
   uint32_t seq;       // monotonic counter; robot accepts only newer seq (dedup)
   int16_t  vx;        // -1000..+1000 (forward+)
   int16_t  vy;        // -1000..+1000 (strafe right+)
   int16_t  omega;     // -1000..+1000 (CCW+)
   uint8_t  buttons;   // bit0=LeftBtn, bit1=RightBtn, bit2=LeftJoyBtn, bit3=RightJoyBtn
-  uint8_t  flags;     // bit0=estop
+  uint8_t  flags;     // bit0=estop; bits1-3 = feature DISABLE bits (see below)
   uint8_t  crc;       // crc8 over all preceding bytes (control_math.h). MUST be last.
 };
+
+// flags bits. bit0 = estop (existing). The mode bits are DISABLE bits so that
+// flags==0 means "all features ON" — i.e. the current/legacy behaviour. Any
+// sender that leaves flags clear (headset, an un-updated controller) keeps every
+// feature enabled, so the wire stays backward-compatible (layout/size unchanged).
+#define CTRL_FLAG_ESTOP      0x01
+#define CTRL_FLAG_GOV_OFF    0x02   // cross-wheel governor disabled
+#define CTRL_FLAG_CL_OFF     0x04   // per-wheel closed-loop disabled (open-loop FF)
+#define CTRL_FLAG_BODY_OFF   0x08   // body-space outer loop disabled
+
+// Host-testable preset -> flags builder. `disableBits` is an OR of the *_OFF bits
+// above; `estop` ORs in the estop bit. Kept tiny + header-only so both the
+// controller firmware and the native unit test share one definition.
+static inline uint8_t ctrlFlagsFromPreset(uint8_t disableBits, bool estop) {
+  uint8_t f = disableBits & (CTRL_FLAG_GOV_OFF | CTRL_FLAG_CL_OFF | CTRL_FLAG_BODY_OFF);
+  if (estop) f |= CTRL_FLAG_ESTOP;
+  return f;
+}
 
 // Wire-format guard. The 13-byte layout is shared verbatim by every TX (robot,
 // controller, headset) and the robot's onRecv rejects any frame whose length !=
@@ -29,7 +49,11 @@ static_assert(sizeof(CtrlPacket) == 13, "CtrlPacket wire format must stay 13 byt
   static const uint8_t ROBOT_MAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0xDB, 0x18 };
 #endif
 
-// Shared WiFi channel for ESP-NOW (no AP needed, but channel must match)
+// Shared WiFi channel for ESP-NOW (no AP needed, but channel must match).
+// Channel 1 is also a default for many home routers. If the robot log shows
+// " (stale)" lines or the controller flickers OFFLINE near the house Wi-Fi, check
+// the router's channel and move this to the one farthest from it (Canada: 1/6/11),
+// then flash robot and controller together.
 static const uint8_t ESPNOW_CHANNEL = 1;
 
 // ESP-NOW link encryption (#3). 0 = plaintext (default — no key coordination

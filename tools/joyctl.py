@@ -11,10 +11,9 @@ Pairs with the test-mode block in src/robot/main.cpp (commands t/s/r/x/?).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
-import os
 import queue
-import re
 import statistics
 import sys
 import threading
@@ -30,65 +29,34 @@ except ImportError:
     sys.stderr.write("error: pyserial not installed. run: pip install pyserial\n")
     sys.exit(1)
 
-
-TLM_RE = re.compile(
-    r"^TLM\s+ms=(\d+)\s+"
-    r"cmd=\[(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\]\s+"
-    r"pwm=\[(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\]\s+"
-    r"raw_tps=\[(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\]\s+"
-    r"cnt=\[(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\]"
-)
-
-
-@dataclass
-class TlmSample:
-    ms: int
-    cmd: list[int]
-    pwm: list[float]
-    raw_tps: list[float]
-    cnt: list[int]
-
-    def as_csv_row(self) -> list[str]:
-        out: list[str] = [str(self.ms)]
-        out += [str(v) for v in self.cmd]
-        out += [f"{v:.0f}" for v in self.pwm]
-        out += [f"{v:.1f}" for v in self.raw_tps]
-        out += [str(v) for v in self.cnt]
-        return out
-
-
-def parse_tlm(line: str) -> Optional[TlmSample]:
-    m = TLM_RE.match(line.strip())
-    if not m:
-        return None
-    g = m.groups()
-    return TlmSample(
-        ms=int(g[0]),
-        cmd=[int(g[1]), int(g[2]), int(g[3]), int(g[4])],
-        pwm=[float(g[5]), float(g[6]), float(g[7]), float(g[8])],
-        raw_tps=[float(g[9]), float(g[10]), float(g[11]), float(g[12])],
-        cnt=[int(g[13]), int(g[14]), int(g[15]), int(g[16])],
-    )
-
-
-CSV_HEADER = (
-    ["ms"]
-    + [f"cmd{i}" for i in range(4)]
-    + [f"pwm{i}" for i in range(4)]
-    + [f"raw_tps{i}" for i in range(4)]
-    + [f"cnt{i}" for i in range(4)]
-)
+from tlm import CSV_HEADER, KEEPALIVE_S, TlmSample, parse_tlm
 
 
 class SerialIO:
-    """Owns the serial port + a reader thread. Lines flow into self.lines."""
+    """Owns the serial port, a reader thread and a keepalive thread.
+
+    Lines flow into self.lines. The keepalive sends `k` every KEEPALIVE_S so the
+    robot's test-link watchdog stays fed while this process is alive; if the
+    process dies or the cable is pulled, the robot stops within 1 s. close() stops
+    the robot and leaves test mode on every exit path (normal, exception, Ctrl-C).
+    """
 
     def __init__(self, port: str, baud: int):
         self.ser = serial.Serial(port, baud, timeout=0.05)
         self.lines: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
+        self._wlock = threading.Lock()   # reader, keepalive and caller share the port
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        self._keepalive = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._keepalive.start()
+
+    def _keepalive_loop(self) -> None:
+        while not self._stop.wait(KEEPALIVE_S):
+            try:
+                self.send("k")
+            except (serial.SerialException, OSError):
+                return   # port gone: the robot's own watchdog takes it from here
 
     def _read_loop(self) -> None:
         buf = bytearray()
@@ -115,10 +83,15 @@ class SerialIO:
     def send(self, cmd: str) -> None:
         if not cmd.endswith("\n"):
             cmd += "\n"
-        self.ser.write(cmd.encode("ascii", "replace"))
-        self.ser.flush()
+        with self._wlock:   # whole lines only: never interleave with the keepalive
+            self.ser.write(cmd.encode("ascii", "replace"))
+            self.ser.flush()
 
     def close(self) -> None:
+        """Stop the robot, leave test mode, release the port. Best effort."""
+        for cmd in ("s", "x"):
+            with contextlib.suppress(serial.SerialException, OSError):
+                self.send(cmd)
         self._stop.set()
         try:
             self.ser.close()
@@ -135,9 +108,10 @@ commands:
   r                     zero encoders + PID
   x                     exit test mode
   ?                     status
-  q                     quit joyctl
+  q                     quit joyctl (stops the robot and leaves test mode)
   help                  this message
-any other text is sent verbatim to the robot.
+any other text is sent verbatim to the robot. joyctl sends a `k` keepalive every
+250 ms; if it dies, the robot stops a driving test within 1 s.
 """
 
 

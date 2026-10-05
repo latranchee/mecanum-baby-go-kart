@@ -10,6 +10,13 @@ static const int PWM_RES  = 10;
 static const int PWM_MAX  = (1 << PWM_RES) - 1;   // 1023
 static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed PWM
 
+// Encoder input glitch filter (PCNT hardware): a pulse shorter than this never
+// reaches the counter. At full speed each encoder channel's pulse is ~230 us wide
+// (MAX_TPS ~8700 edges/s = 4 edges per 460 us cycle); motor-switching spikes are a
+// few us. The ESP32 filter tops out at ~12.7 us (1023 APB cycles), so setting this
+// higher makes encoder init fail and the robot refuse to drive.
+static const uint32_t ENC_GLITCH_NS = 10000;
+
 // Velocity control
 // Per-wheel full-PWM tick rate (ticks/sec) — slot order [FL,FR,RL,RR].
 // 4x quadrature decode (BUG-008 fixed): every A/B edge counts, so the tick rate
@@ -19,15 +26,30 @@ static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed 
 // is what lets feed-forward + the governor normalize correctly (the whole point
 // of this change). Calibrate with tools/calibrate_maxtps.py (wheels off ground).
 // Feed-forward gain is derived per wheel as PWM_MAX / MAX_TPS[i] at use site.
-// Measured 2026-06-02 (4x decode, no-load, full PWM, min of fwd/rev per wheel):
-// wheels within ~5% — packs well matched at no-load. RR weakest = uniform ref.
-static const float MAX_TPS[4] = { 8275.0f, 8483.0f, 8342.0f, 8230.0f };
+// Measured 2026-06-07 (2-battery / dual-20A-buck rig, 4x decode, no-load, full PWM,
+// min of fwd/rev per wheel): wheels within ~3% (skew <2.5%) — rails well matched,
+// no buck mismatch. FL weakest = uniform ref. Supersedes the 2026-06-02 single-buck
+// values (8275/8483/8342/8230), which under-stated by ~3% so cmd 1000 targeted below
+// the wheels' real top speed. Recalibrate again whenever the supply changes.
+static const float MAX_TPS[4] = { 8502.0f, 8688.0f, 8778.0f, 8669.0f };
 // Smallest per-wheel max — used where one scalar reference is still needed.
 static inline float maxTpsMin() {
   float m = MAX_TPS[0];
   for (int i = 1; i < 4; i++) if (MAX_TPS[i] < m) m = MAX_TPS[i];
   return m;
 }
+// Commanded-speed reference: cmd 1000 targets this fraction of the weakest wheel's
+// NO-LOAD speed, not all of it. At 1.0 the feed-forward alone (PWM_MAX * ref /
+// MAX_TPS[i]) put every wheel at 97-100% PWM, and past GOV_SAT_FRAC from ~850 wheel
+// command up with no load at all — so near full stick the body loop froze itself
+// (anySat) and the PI had no PWM left to pull a lagging wheel up: open loop exactly
+// where a loaded cart needs the loop. At 0.80, full-stick feed-forward is ~80% PWM:
+// 5 points under the saturation gate, 20 under the rail. Cost: the same stick and
+// speed setting now drive 20% slower. Must stay under GOV_SAT_FRAC with margin
+// (test_full_cmd_feedforward_headroom).
+static const float SPEED_REF_FRAC = 0.80f;
+// The one speed cmd 1000 means on every wheel (ticks/sec).
+static inline float cmdRefTps() { return SPEED_REF_FRAC * maxTpsMin(); }
 static const float Kp      = 0.15f;
 static const float Ki      = 0.3f;                      // glitch rejection now guards windup, so raise Ki back up to regulate weak/loaded wheels (was under-driving right side -> drift)
 static const float I_MAX   = 0.55f * (float)PWM_MAX;    // bound integral authority (~563)
@@ -57,8 +79,19 @@ static const float PWM_SLEW = 2500.0f;  // full 0..1023 in ~410ms
 //                the fix for the old latch where forward drive stuck at the floor.
 //   GOV_SLEW   : how fast the applied scale may move (1/sec), low-passed so a
 //                transient startup lag can't collapse drive and recovery is smooth.
+// The three stacked control features — this cross-wheel governor, the per-wheel
+// closed-loop PI, and the body-space outer loop (below) — are INDEPENDENT runtime
+// toggles. Each compile macro here (SYNC_GOVERNOR / CLOSED_LOOP_DEFAULT /
+// BODY_LOOP) only sets the BOOT default; src/robot/main.cpp mirrors them into RAM
+// flags the controller (or serial g/c/b) can flip live for A/B testing. A power
+// cycle returns to these compile defaults.
 #ifndef SYNC_GOVERNOR
 #define SYNC_GOVERNOR 1
+#endif
+// Per-wheel closed-loop PI default. 1 = closed loop (FF + P/I on measured speed);
+// 0 = open-loop feed-forward only. Runtime-toggleable (CTRL_FLAG_CL_OFF / `c`).
+#ifndef CLOSED_LOOP_DEFAULT
+#define CLOSED_LOOP_DEFAULT 1
 #endif
 static const float GOV_FLOOR    = 0.10f;
 static const float GOV_SAT_FRAC = 0.85f;  // |out| >= 85% PWM_MAX = wheel maxed out
@@ -153,11 +186,44 @@ static const float STALL_PWM_FRAC = 0.85f;   // |out| above this fraction of PWM
 static const float STALL_TPS_FRAC = 0.08f;   // |measured| below this fraction of MAX_TPS
 static const float STALL_MS       = 300.0f;  // sustained for this long
 
-// Link watchdog: stop motors if no fresh packet for this long.
+// Drive fault (safety.h driveFaultStep): a wheel at or above FAULT_PWM_FRAC of
+// PWM_MAX that measures under FAULT_TPS_FRAC of its MAX_TPS for FAULT_MS = dead
+// encoder or jammed wheel. Every motor stops and the fault LATCHES: it clears after
+// FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live link, or `r`/`x` on the
+// bench. A free wheel at 30% PWM turns ~2500 tps and a loaded one still clears
+// 170 tps (1.7 ticks per 10 ms) within a few ticks of breakaway, so only a wheel
+// that is truly not turning trips. A persistent dead encoder re-trips on each
+// attempt after ~0.4 s of travel, which is the cue to look at the cart.
+static const float    FAULT_PWM_FRAC = 0.30f;
+static const float    FAULT_TPS_FRAC = 0.02f;
+static const float    FAULT_MS       = 300.0f;
+static const uint32_t FAULT_CLEAR_MS = 1000;
+
+// Link watchdog: stop motors if no fresh packet for this long. Also the silence
+// after which the receive gate reopens for a rebooted/other controller (safety.h).
 static const uint32_t WATCHDOG_MS = 500;
 
+// Bench test mode (serial t/m commands) has no radio packets to feed the watchdog,
+// so it runs its own: if no serial line arrives for TEST_LINK_MS while a test is
+// driving, the robot stops. Bench tools send `k` every 250 ms as a keepalive; a
+// crashed script or a pulled cable now stops the cart instead of leaving it driving.
+static const uint32_t TEST_LINK_MS = 1000;
+
+// Control tick, scheduled on micros() at a fixed rate (no drift, true dt).
+static const uint32_t CTRL_PERIOD_US = 10000;   // 100 Hz
+
+// Loop watchdog (task WDT). The LEDC peripheral keeps its last duty if loop()
+// hangs, so a hang used to leave the motors running. The control tick feeds the
+// task watchdog; on expiry an ISR hook drops every direction pin LOW (brake/coast)
+// and the chip reboots. Also governs the core-0 idle check (was 5 s).
+static const uint32_t LOOP_WDT_MS = 500;
+
 // Battery sensing (#5). No divider wired by default -> disabled (pin -1), so no
-// fabricated voltage is logged. To enable: set BATT_ADC_PIN to the ADC-capable
-// GPIO reading the divider, and BATT_DIVIDER to Vbatt/Vadc (the divider ratio).
+// fabricated voltage is logged. NOTE: on this pin map NO ADC pin is free. ADC1 is
+// GPIO32-39 and every one is taken (32/33 = motor direction, 34/35/36/39 = encoder
+// inputs); ADC2 cannot be read while the ESP-NOW radio runs. Enabling this needs a
+// hardware change first: move a direction line off GPIO32/33 to free an ADC1 pin,
+// or read the pack over I2C (an INA226 also gives motor current). Then set
+// BATT_ADC_PIN to that ADC1 GPIO and BATT_DIVIDER to Vbatt/Vadc.
 static const int   BATT_ADC_PIN = -1;
 static const float BATT_DIVIDER = 1.0f;

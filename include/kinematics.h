@@ -44,6 +44,43 @@ static inline void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t out
   normalizeQuad(outCmd, 1000);
 }
 
+// Inverse of mecanumMix's linear core on a wheel COMMAND set: the body twist the
+// four commands actually express, in cmd units. It differs from the packet twist
+// whenever the mix normalized (|vx|+|vy|+|omega| > 1000) or the slew is mid-ramp,
+// so any loop judging "what was asked" (governor spin relax, body loop) must use
+// this, not the raw packet. Integer twin of forwardKinematics below.
+static inline void mixInverse(const int32_t c[4], int32_t* vx, int32_t* vy, int32_t* omega) {
+  *vx    = ( c[0] + c[1] + c[2] + c[3]) / 4;
+  *vy    = (-c[0] + c[1] + c[2] - c[3]) / 4;
+  *omega = (-c[0] + c[1] - c[2] + c[3]) / 4;
+}
+
+// Step a wheel command set toward its target by at most maxStep on any wheel,
+// moving all four along the straight line between them so they arrive on the same
+// tick. Clamping each wheel independently let small targets arrive first and bent
+// the twist mid-ramp: forward+turn from rest drove straight for ~300 ms before the
+// turn came in, and a release veered the other way. mecanumMix is linear, so a
+// straight line in wheel space is a straight line in twist space and the commanded
+// direction holds through the whole ramp. The inrush cap is unchanged: the wheel
+// with the largest change steps exactly maxStep, every other wheel steps less.
+// maxStep must be >= 1. Pure integer math (|d|*maxStep stays far inside int32).
+static inline void slewQuad(int32_t cur[4], const int32_t tgt[4], int32_t maxStep) {
+  int32_t big = 0;
+  for (int i = 0; i < 4; i++) {
+    int32_t a = tgt[i] - cur[i];
+    if (a < 0) a = -a;
+    if (a > big) big = a;
+  }
+  if (big <= maxStep) {
+    for (int i = 0; i < 4; i++) cur[i] = tgt[i];
+    return;
+  }
+  for (int i = 0; i < 4; i++) {
+    int32_t num = (tgt[i] - cur[i]) * maxStep;
+    cur[i] += (num >= 0 ? num + big / 2 : num - big / 2) / big;  // round half away
+  }
+}
+
 // Forward kinematics — recover the body twist (vx,vy,omega) and a slip/null
 // coordinate (s) from measured wheel speeds. Exact inverse of mecanumMix's linear
 // core: its three input columns are mutually orthogonal with norm^2 = 4, so each
@@ -51,7 +88,7 @@ static inline void mecanumMix(int16_t vx, int16_t vy, int16_t omega, int32_t out
 //
 //   measTps[i] : measured signed ticks/sec per wheel, slot order [FL,FR,RL,RR]
 //                (the encSign-corrected, glitch-clamped lastMeasTps[]).
-//   refTps     : UNIFORM normalization reference (= maxTpsMin()) — the SAME scalar
+//   refTps     : UNIFORM normalization reference (= cmdRefTps()) — the SAME scalar
 //                the inner loop targets for cmd 1000. Dividing by it puts the body
 //                estimate back in cmd units (+/-1000 == refTps). MUST NOT be the
 //                per-wheel MAX_TPS[i]: normalizing each wheel to its own max would
