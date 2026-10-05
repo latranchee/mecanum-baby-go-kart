@@ -14,6 +14,7 @@ Pairs with the test-mode block in src/robot/main.cpp (commands m/s/r/x).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import statistics
 import sys
 import time
@@ -24,16 +25,21 @@ except ImportError:
     sys.stderr.write("error: pyserial not installed. run: pip install pyserial\n")
     sys.exit(1)
 
-from tlm import parse_tlm
+from tlm import KEEPALIVE_S, parse_tlm
 
 SLOTS = ["FL", "FR", "RL", "RR"]
 
 
 def read_lines(ser, seconds):
-    """Yield decoded lines from the port for `seconds`."""
+    """Yield decoded lines from the port for `seconds`, sending the `k` keepalive
+    the robot's test-link watchdog needs while a wheel is driven."""
     buf = bytearray()
     deadline = time.monotonic() + seconds
+    next_k = 0.0
     while time.monotonic() < deadline:
+        if time.monotonic() >= next_k:
+            ser.write(b"k\n"); ser.flush()
+            next_k = time.monotonic() + KEEPALIVE_S
         chunk = ser.read(256)
         if not chunk:
             continue
@@ -81,31 +87,34 @@ def main() -> int:
         sys.stderr.write(f"error: cannot open {args.port}: {e}\n")
         return 2
 
-    time.sleep(1.8)                          # RTS resets the ESP32 on open; wait for boot
-    ser.reset_input_buffer()
-    ser.write(b"s\n"); ser.flush()           # enter test mode, all stopped
-    time.sleep(0.3)
-    # Confirm we're actually in test mode (TLM streaming) before driving.
-    if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
-        ser.write(b"s\n"); ser.flush(); time.sleep(0.3)
-        if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
-            sys.stderr.write("error: no TLM stream — robot not in test mode. Check port/boot.\n")
-            ser.close(); return 3
-
-    print("=== MAX_TPS calibration (wheels MUST be off the ground) ===")
-    print(f"port={args.port} pwm={args.pwm} spin={args.spin}s/dir\n")
     fwd, rev = [0.0] * 4, [0.0] * 4
-    for s in range(4):
-        f, nf = measure(ser, s, args.pwm, args.spin, args.settle)
-        r, nr = measure(ser, s, -args.pwm, args.spin, args.settle)
-        fwd[s], rev[s] = f, r
-        lo, hi = min(f, r), max(f, r)
-        skew = 0.0 if hi == 0 else (hi - lo) / hi * 100.0
-        warn = "  <-- WARN >15% fwd/rev skew" if skew > 15 else ""
-        print(f"  {SLOTS[s]} (slot {s}): fwd={f:7.0f} ({nf:3d})  rev={r:7.0f} ({nr:3d})  skew={skew:4.1f}%{warn}")
+    try:
+        time.sleep(1.8)                      # RTS resets the ESP32 on open; wait for boot
+        ser.reset_input_buffer()
+        ser.write(b"s\n"); ser.flush()       # enter test mode, all stopped
+        time.sleep(0.3)
+        # Confirm we're actually in test mode (TLM streaming) before driving.
+        if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
+            ser.write(b"s\n"); ser.flush(); time.sleep(0.3)
+            if not any(parse_tlm(l) for l in read_lines(ser, 1.0)):
+                sys.stderr.write("error: no TLM stream — robot not in test mode. Check port/boot.\n")
+                return 3
 
-    ser.write(b"x\n"); ser.flush()           # exit test mode -> ESP-NOW resumes
-    ser.close()
+        print("=== MAX_TPS calibration (wheels MUST be off the ground) ===")
+        print(f"port={args.port} pwm={args.pwm} spin={args.spin}s/dir\n")
+        for s in range(4):
+            f, nf = measure(ser, s, args.pwm, args.spin, args.settle)
+            r, nr = measure(ser, s, -args.pwm, args.spin, args.settle)
+            fwd[s], rev[s] = f, r
+            lo, hi = min(f, r), max(f, r)
+            skew = 0.0 if hi == 0 else (hi - lo) / hi * 100.0
+            warn = "  <-- WARN >15% fwd/rev skew" if skew > 15 else ""
+            print(f"  {SLOTS[s]} (slot {s}): fwd={f:7.0f} ({nf:3d})  rev={r:7.0f} ({nr:3d})  skew={skew:4.1f}%{warn}")
+    finally:
+        # Stop and leave test mode on every exit path (error, Ctrl-C included).
+        with contextlib.suppress(serial.SerialException, OSError):
+            ser.write(b"s\n"); ser.write(b"x\n"); ser.flush()
+        ser.close()
 
     # Use the smaller of fwd/rev per wheel: it's the rate that limits closed-loop.
     maxtps = [min(fwd[i], rev[i]) for i in range(4)]
@@ -114,7 +123,7 @@ def main() -> int:
           f"{maxtps[2]:.0f}.0f, {maxtps[3]:.0f}.0f }};")
     weakest = min(maxtps)
     print(f"\nWeakest wheel = {weakest:.0f} tps ({SLOTS[maxtps.index(weakest)]})."
-          " cmd 1000 targets SPEED_REF_FRAC of it; update MAX_TPS_MIN in verify_sweep.py too.")
+          " cmd 1000 targets SPEED_REF_FRAC of it (verify_sweep.py reads config_robot.h).")
     if weakest > 0 and max(maxtps) / weakest > 1.2:
         print("NOTE: >20% spread across wheels — the two battery halves are mismatched."
               "\n      Top speed is capped to the weakest. Match pack V/SoC to raise it.")

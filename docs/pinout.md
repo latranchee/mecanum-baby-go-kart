@@ -31,8 +31,8 @@ Per motor: P (speed) + A + B (direction state) = 3 signal wires from MCU.
 | M- | Motor power negative (to driver output) |
 | VCC | Encoder sensor supply (3.3V or 5V) |
 | GND | Encoder sensor ground |
-| A | Quadrature phase A (to MCU, interrupt pin) |
-| B | Quadrature phase B (to MCU, GPIO) |
+| A | Quadrature phase A (to MCU, PCNT input) |
+| B | Quadrature phase B (to MCU, PCNT input) |
 
 **Warning:** VCC and GND polarity must be correct or encoder PCB will be damaged.
 
@@ -43,37 +43,48 @@ Per motor: P (speed) + A + B (direction state) = 3 signal wires from MCU.
 | Driver PWM (4 channels) | 4 | PWM-capable |
 | Driver INA (4 channels) | 4 | GPIO |
 | Driver INB (4 channels) | 4 | GPIO |
-| Encoder A (4 motors) | 4 | Interrupt-capable |
-| Encoder B (4 motors) | 4 | GPIO (input-only OK) |
-| **Total** | **20** | 4 PWM + 4 INT |
+| Encoder A (4 motors) | 4 | Any input (PCNT, input-only OK) |
+| Encoder B (4 motors) | 4 | Any input (PCNT, input-only OK) |
+| **Total** | **20** | 4 PWM |
 
 ---
 
-## Current wiring (1 ESP32 + 1 driver module, 2 motors)
+## Current wiring (1 ESP32, 2 driver modules, 4 motors)
 
-### Driver → ESP32 wire map
+Source of truth: the `motors[]` table at the top of `src/robot/main.cpp`. Slot =
+array index = wheel corner. Encoders are decoded in hardware by the PCNT pulse
+counters (4x quadrature), so any input-capable GPIO works for A and B.
 
-| Driver pin | Wire color | ESP32 pin | Role |
-|---|---|---|---|
-| G | black | GND | Logic ground |
-| G | — | — | (unused, redundant) |
-| V | red | 5V | Logic supply |
-| V | — | — | (unused, redundant) |
-| B1 | gray | GPIO27 | Motor 1 INB |
-| B2 | purple | GPIO14 | Motor 2 INB |
-| A1 | green | GPIO33 | Motor 1 INA |
-| A2 | yellow | GPIO32 | Motor 2 INA |
-| P1 | blue | GPIO25 | Motor 1 PWM |
-| P2 | brown | GPIO26 | Motor 2 PWM |
+| Slot | Corner | PWM | INA | INB | Enc A | Enc B | Harness labels (layout table below) |
+|---|---|---|---|---|---|---|---|
+| 0 | FL | 18 | 5 | 19 | 13 | 17 | P3, A3, B3 / M4 enc |
+| 1 | FR | 21 | 23 | 22 | 16 | 4 | P4, B4 = INA, A4 = INB / M3 enc |
+| 2 | RL | 25 | 27 | 33 | 39 | 36 | P1, B1 = INA, A1 = INB / M1 enc |
+| 3 | RR | 26 | 32 | 14 | 35 | 34 | P2, A2, B2 / M2 enc |
 
-### Encoder → ESP32 wire map
+The harness numbers (1-4, M1-M4) are the physical driver channels and wire
+labels; they predate the 2026-05-31 body swap. Where the code's INA sits on a
+"B" wire, the swap inverts that motor's direction in software (see the comment
+on `motors[]`).
 
-| Motor | Phase | Wire color | ESP32 pin |
-|---|---|---|---|
-| M1 | A | yellow | GPIO16 |
-| M1 | B | white | GPIO17 |
-| M2 | A | yellow | GPIO4 |
-| M2 | B | white | GPIO5 |
+### Boot and reset state
+
+Between reset and `setup()` every GPIO is an input, so the driver's PWM and
+direction inputs float. GPIO5 (FL INA) and GPIO14 (RR INB) are also commonly
+reported to toggle during the ROM boot. Each driver PWM input (GPIO18, 21, 25,
+26) should have a pull-down (10 kOhm to GND) unless the driver module already
+has one, so a reset, a brownout or a watchdog reboot can't twitch a wheel.
+Check the module before relying on it.
+
+The loop watchdog's ISR hook drives every INA/INB LOW (brake/coast) before the
+reboot, which covers the hang itself; the pull-downs cover the reboot window.
+
+### No free ADC pin
+
+ADC1 is GPIO32-39 and all of them are used (32/33 direction, 34/35/36/39
+encoders). ADC2 cannot be read while ESP-NOW runs. Battery sensing needs a
+direction line moved off GPIO32/33, or an I2C monitor (INA226: voltage and
+motor current).
 
 ### ESP32-WROOM-32D 38-pin layout
 

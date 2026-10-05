@@ -3,7 +3,9 @@
 
 // ESP-NOW packet: controller -> robot
 // Send rate ~50Hz. Robot watchdog stops motors if no packet for 500ms.
-// Robot drops frames whose seq is not newer (dedup) or whose crc8 mismatches.
+// Robot drops frames whose crc8 mismatches, frames from a second transmitter while
+// the link is live, and frames whose seq is not newer (dedup). After 500 ms of
+// silence it accepts the next valid frame from anyone (safety.h linkGateCheck).
 struct __attribute__((packed)) CtrlPacket {
   uint32_t seq;       // monotonic counter; robot accepts only newer seq (dedup)
   int16_t  vx;        // -1000..+1000 (forward+)
@@ -47,7 +49,11 @@ static_assert(sizeof(CtrlPacket) == 13, "CtrlPacket wire format must stay 13 byt
   static const uint8_t ROBOT_MAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0xDB, 0x18 };
 #endif
 
-// Shared WiFi channel for ESP-NOW (no AP needed, but channel must match)
+// Shared WiFi channel for ESP-NOW (no AP needed, but channel must match).
+// Channel 1 is also a default for many home routers. If the robot log shows
+// " (stale)" lines or the controller flickers OFFLINE near the house Wi-Fi, check
+// the router's channel and move this to the one farthest from it (Canada: 1/6/11),
+// then flash robot and controller together.
 static const uint8_t ESPNOW_CHANNEL = 1;
 
 // ESP-NOW link encryption (#3). 0 = plaintext (default — no key coordination

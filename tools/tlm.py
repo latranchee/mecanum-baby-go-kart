@@ -8,9 +8,48 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 _FIELD_RE = re.compile(r"(\w+)=(\[[^\]]*\]|\S+)")
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Bench tools send this while a test drives: the robot stops a driving test after
+# TEST_LINK_MS (1 s) with no serial line, so a crashed script or pulled cable can't
+# leave it running. The robot accepts `k` silently.
+KEEPALIVE_S = 0.25
+
+
+def _c_floats(text: str, pattern: str) -> list[float]:
+    m = re.search(pattern, text)
+    if not m:
+        raise ValueError(f"pattern not found: {pattern}")
+    return [float(v.strip().rstrip("fF")) for v in m.group(1).split(",") if v.strip()]
+
+
+@dataclass
+class RobotConfig:
+    max_tps: list[float]      # include/config_robot.h MAX_TPS[4], slot order FL FR RL RR
+    speed_ref_frac: float     # include/config_robot.h SPEED_REF_FRAC
+    enc_sign: list[int]       # src/robot/main.cpp encSign[4]
+
+    @property
+    def ref_tps(self) -> float:
+        """Ticks/sec that cmd 1000 targets on every wheel (firmware cmdRefTps())."""
+        return self.speed_ref_frac * min(self.max_tps)
+
+
+def robot_config() -> RobotConfig:
+    """Read the calibration constants straight from the firmware sources, so the
+    tools can't drift from what the robot runs."""
+    cfg = (_REPO / "include" / "config_robot.h").read_text(encoding="utf-8")
+    src = (_REPO / "src" / "robot" / "main.cpp").read_text(encoding="utf-8")
+    return RobotConfig(
+        max_tps=_c_floats(cfg, r"MAX_TPS\[4\]\s*=\s*\{([^}]*)\}"),
+        speed_ref_frac=_c_floats(cfg, r"SPEED_REF_FRAC\s*=\s*([0-9.]+f?)\s*;")[0],
+        enc_sign=[int(v) for v in _c_floats(src, r"encSign\[4\]\s*=\s*\{([^}]*)\}")],
+    )
 
 
 def parse_fields(line: str) -> dict[str, str]:

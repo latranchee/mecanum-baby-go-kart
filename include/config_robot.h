@@ -186,11 +186,44 @@ static const float STALL_PWM_FRAC = 0.85f;   // |out| above this fraction of PWM
 static const float STALL_TPS_FRAC = 0.08f;   // |measured| below this fraction of MAX_TPS
 static const float STALL_MS       = 300.0f;  // sustained for this long
 
-// Link watchdog: stop motors if no fresh packet for this long.
+// Drive fault (safety.h driveFaultStep): a wheel at or above FAULT_PWM_FRAC of
+// PWM_MAX that measures under FAULT_TPS_FRAC of its MAX_TPS for FAULT_MS = dead
+// encoder or jammed wheel. Every motor stops and the fault LATCHES: it clears after
+// FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live link, or `r`/`x` on the
+// bench. A free wheel at 30% PWM turns ~2500 tps and a loaded one still clears
+// 170 tps (1.7 ticks per 10 ms) within a few ticks of breakaway, so only a wheel
+// that is truly not turning trips. A persistent dead encoder re-trips on each
+// attempt after ~0.4 s of travel, which is the cue to look at the cart.
+static const float    FAULT_PWM_FRAC = 0.30f;
+static const float    FAULT_TPS_FRAC = 0.02f;
+static const float    FAULT_MS       = 300.0f;
+static const uint32_t FAULT_CLEAR_MS = 1000;
+
+// Link watchdog: stop motors if no fresh packet for this long. Also the silence
+// after which the receive gate reopens for a rebooted/other controller (safety.h).
 static const uint32_t WATCHDOG_MS = 500;
 
+// Bench test mode (serial t/m commands) has no radio packets to feed the watchdog,
+// so it runs its own: if no serial line arrives for TEST_LINK_MS while a test is
+// driving, the robot stops. Bench tools send `k` every 250 ms as a keepalive; a
+// crashed script or a pulled cable now stops the cart instead of leaving it driving.
+static const uint32_t TEST_LINK_MS = 1000;
+
+// Control tick, scheduled on micros() at a fixed rate (no drift, true dt).
+static const uint32_t CTRL_PERIOD_US = 10000;   // 100 Hz
+
+// Loop watchdog (task WDT). The LEDC peripheral keeps its last duty if loop()
+// hangs, so a hang used to leave the motors running. The control tick feeds the
+// task watchdog; on expiry an ISR hook drops every direction pin LOW (brake/coast)
+// and the chip reboots. Also governs the core-0 idle check (was 5 s).
+static const uint32_t LOOP_WDT_MS = 500;
+
 // Battery sensing (#5). No divider wired by default -> disabled (pin -1), so no
-// fabricated voltage is logged. To enable: set BATT_ADC_PIN to the ADC-capable
-// GPIO reading the divider, and BATT_DIVIDER to Vbatt/Vadc (the divider ratio).
+// fabricated voltage is logged. NOTE: on this pin map NO ADC pin is free. ADC1 is
+// GPIO32-39 and every one is taken (32/33 = motor direction, 34/35/36/39 = encoder
+// inputs); ADC2 cannot be read while the ESP-NOW radio runs. Enabling this needs a
+// hardware change first: move a direction line off GPIO32/33 to free an ADC1 pin,
+// or read the pack over I2C (an INA226 also gives motor current). Then set
+// BATT_ADC_PIN to that ADC1 GPIO and BATT_DIVIDER to Vbatt/Vadc.
 static const int   BATT_ADC_PIN = -1;
 static const float BATT_DIVIDER = 1.0f;

@@ -6,6 +6,7 @@
 #include "protocol.h"
 #include "config_controller.h"  // pulls in curve.h (CurveCfg/CURVE) + tunables
 #include "control_math.h"       // normalize(), clampI32(), crc8()
+#include "controller_logic.h"   // stick calibration, arming, mode-click gesture
 
 // Atom JoyStick: AtomS3 (ESP32-S3) + STM32 co-processor at I2C 0x59.
 // I2C: SDA=GPIO38, SCL=GPIO39, 400kHz on Wire1 (matches original firmware).
@@ -27,8 +28,9 @@ static const int I2C_SDA = 38;
 static const int I2C_SCL = 39;
 
 // "Left/Right" below = USER's physical sticks (not M5 reg labels — see above).
-static uint16_t centerLHoriz = 2048, centerLVert = 2048;
-static uint16_t centerRHoriz = 2048, centerRVert = 2048;
+// Axis order used by the calibration arrays: L horiz, L vert, R horiz, R vert.
+enum Axis : uint8_t { AX_LH = 0, AX_LV = 1, AX_RH = 2, AX_RV = 3 };
+static uint16_t center[4] = { CENTER_NOMINAL, CENTER_NOMINAL, CENTER_NOMINAL, CENTER_NOMINAL };
 
 // DEADZONE_RAW / HALF_RANGE in config_controller.h. CurveCfg/CURVE in curve.h
 // (via config_controller.h); applyCurve() in curve.h.
@@ -56,34 +58,15 @@ static bool readButtons(uint8_t out[4]) {
   return readRegs(REG_BTNS, out, 4);
 }
 
-// normalize() now in include/control_math.h (host-testable). Thin wrapper binds
-// the controller's tuning constants so call sites stay 2-arg.
-static inline int16_t normalize(uint16_t raw, uint16_t center) {
-  return normalize(raw, center, DEADZONE_RAW, HALF_RANGE);
+static void beginJoyBus() {
+  Wire1.begin(I2C_SDA, I2C_SCL);
+  Wire1.setClock(400000);
 }
 
-static void calibrateCenter() {
-  uint32_t sumLH = 0, sumLV = 0, sumRH = 0, sumRV = 0;
-  const int N = 16;
-  int ok = 0;
-  for (int i = 0; i < N; i++) {
-    uint16_t lh, lv, rh, rv;
-    // PHYS_LEFT reg holds user's left stick; PHYS_RIGHT reg holds user's right stick.
-    if (readStick(REG_STICK_LEFT_PHYS,  &lh, &lv) &&
-        readStick(REG_STICK_RIGHT_PHYS, &rh, &rv)) {
-      sumLH += lh; sumLV += lv; sumRH += rh; sumRV += rv;
-      ok++;
-    }
-    delay(10);
-  }
-  if (ok > 0) {
-    centerLHoriz = sumLH / ok;
-    centerLVert  = sumLV / ok;
-    centerRHoriz = sumRH / ok;
-    centerRVert  = sumRV / ok;
-  }
-  Serial.printf("Centers: L=(h%u,v%u) R=(h%u,v%u) n=%d\n",
-                centerLHoriz, centerLVert, centerRHoriz, centerRVert, ok);
+// normalize() now in include/control_math.h (host-testable). Thin wrapper binds
+// the controller's tuning constants so call sites stay 2-arg.
+static inline int16_t normalize(uint16_t raw, uint16_t c) {
+  return normalize(raw, c, DEADZONE_RAW, HALF_RANGE);
 }
 
 // ---------------- ESP-NOW ----------------
@@ -132,11 +115,20 @@ static void setupEspNow() {
   }
 }
 
+static uint32_t seq = 0;
+
+static void sendPacket(int16_t vx, int16_t vy, int16_t omega, uint8_t buttons, uint8_t flags) {
+  CtrlPacket pkt = { ++seq, vx, vy, omega, buttons, flags, 0 };
+  pkt.crc = crc8((const uint8_t*)&pkt, offsetof(CtrlPacket, crc));  // integrity (#4)
+  if (peerAdded) esp_now_send(ROBOT_MAC, (uint8_t*)&pkt, sizeof(pkt));
+}
+
 // ---------------- Feature-mode presets ----------------
-// Left joystick-click cycles this ordered list. Each entry = display name + the
-// DISABLE bits sent in CtrlPacket.flags (protocol.h). FULL = nothing disabled =
-// every robot feature ON (legacy behaviour). The robot mirrors these bits into
-// its runtime toggles each packet, so the controller is authoritative in the field.
+// Left joystick-click cycles this ordered list (on release, see controller_logic.h
+// modeClickStep). Each entry = display name + the DISABLE bits sent in
+// CtrlPacket.flags (protocol.h). FULL = nothing disabled = every robot feature ON
+// (legacy behaviour). The robot mirrors these bits into its runtime toggles each
+// packet, so the controller is authoritative in the field.
 struct ModePreset { const char* name; uint8_t disableBits; };
 static const ModePreset MODE_PRESETS[] = {
   { "FULL",    0 },
@@ -148,17 +140,38 @@ static const ModePreset MODE_PRESETS[] = {
 static const uint8_t NMODES      = sizeof(MODE_PRESETS) / sizeof(MODE_PRESETS[0]);
 static uint8_t       modeIdx     = 0;
 static uint8_t       lastModeIdx = 0xFF;   // != any valid idx -> force first draw
+static ModeClick     modeClick   = {};
+
+// ---------------- Input state ----------------
+static StickCal cal         = {};
+static bool     calibrated  = false;  // trusted stick centre found (controller_logic.h)
+static bool     armed       = false;  // drive commands allowed (controller_logic.h armStep)
+static bool     estopHeld   = false;  // both stick clicks down on the last good read
+static uint16_t joyFails    = 0;      // consecutive failed I2C reads
+static uint32_t lastReinitMs = 0;
 
 // ---------------- Display ----------------
 // AtomS3 LCD is 128x128. Layout:
 //   Header bar: "MECANUM"
-//   Status:     "ONLINE" green / "OFFLINE" red (last-ack age)
-//   Speed:      big number "  70%"
-//   Footer:     seq counter
+//   Status bar: one state, highest priority first (StatusView below)
+//   SPD row:    speed % left, mode preset right
+//   Sticks:     four rows, redrawn on change
 static uint8_t  speedPct      = 50;       // 10..100, step 10
 static uint8_t  lastSpeedPct  = 0;
-static bool     lastConnected = false;
 static uint32_t lastDispMs    = 0;
+
+// What the status bar shows. Everything that stops the cart has its own word, so
+// the screen never says ONLINE while the controller is not driving.
+enum StatusView : uint8_t { SV_NONE, SV_NO_RADIO, SV_JOY_ERR, SV_ESTOP, SV_CENTER, SV_ONLINE, SV_OFFLINE };
+static StatusView lastView = SV_NONE;
+
+static StatusView currentView(uint32_t now) {
+  if (!peerAdded)                return SV_NO_RADIO;   // radio dead: nothing is sent
+  if (joyFails >= JOY_FAIL_TRIP) return SV_JOY_ERR;    // sticks unreadable: e-stop sent
+  if (estopHeld)                 return SV_ESTOP;
+  if (!calibrated || !armed)     return SV_CENTER;     // release / centre the sticks
+  return (now - lastAckMs) < 500 ? SV_ONLINE : SV_OFFLINE;
+}
 
 static void drawHeader() {
   M5.Display.fillRect(0, 0, 128, 16, TFT_DARKGREY);
@@ -168,13 +181,23 @@ static void drawHeader() {
   M5.Display.drawString("MECANUM", 64, 4);
 }
 
-static void drawStatus(bool connected) {
-  uint16_t bg = connected ? TFT_DARKGREEN : TFT_RED;
+static void drawStatus(StatusView v) {
+  const char* text = "";
+  uint16_t bg = TFT_RED, fg = TFT_WHITE;
+  switch (v) {
+    case SV_NO_RADIO: text = "NO RADIO"; break;
+    case SV_JOY_ERR:  text = "JOY ERR";  break;
+    case SV_ESTOP:    text = "E-STOP";   break;
+    case SV_CENTER:   text = "CENTER";   bg = TFT_ORANGE; fg = TFT_BLACK; break;
+    case SV_ONLINE:   text = "ONLINE";   bg = TFT_DARKGREEN; break;
+    case SV_OFFLINE:  text = "OFFLINE";  break;
+    default: break;
+  }
   M5.Display.fillRect(0, 16, 128, 16, bg);
-  M5.Display.setTextColor(TFT_WHITE, bg);
+  M5.Display.setTextColor(fg, bg);
   M5.Display.setTextDatum(middle_center);
   M5.Display.setTextSize(2);
-  M5.Display.drawString(connected ? "ONLINE" : "OFFLINE", 64, 24);
+  M5.Display.drawString(text, 64, 24);
 }
 
 static void drawSpeedCompact(uint8_t pct) {
@@ -224,11 +247,32 @@ static void drawSticks(int16_t lVertN, int16_t lHorizN, int16_t rVertN, int16_t 
   }
 }
 
+// Status/speed/mode on change, sticks every call. Runs on every send tick at
+// ~10 Hz — including ticks where the joystick read failed, so the status bar
+// always tells the truth.
+static void refreshDisplay(uint32_t now, const int16_t* sticks /* lV,lH,rV,rH or null */) {
+  if (now - lastDispMs < 100) return;
+  lastDispMs = now;
+  StatusView v = currentView(now);
+  if (v != lastView) {
+    drawStatus(v);
+    lastView = v;
+  }
+  if (speedPct != lastSpeedPct) {
+    drawSpeedCompact(speedPct);
+    lastSpeedPct = speedPct;
+  }
+  if (modeIdx != lastModeIdx) {
+    drawMode(modeIdx);
+    lastModeIdx = modeIdx;
+  }
+  if (sticks) drawSticks(sticks[0], sticks[1], sticks[2], sticks[3]);
+}
+
 static void initDisplay() {
   M5.Display.setRotation(0);
   M5.Display.fillScreen(TFT_BLACK);
   drawHeader();
-  drawStatus(false);
   drawSpeedCompact(speedPct);
   drawMode(modeIdx);
   drawSticks(0, 0, 0, 0);
@@ -244,28 +288,17 @@ void setup() {
 
   initDisplay();
 
-  Wire1.begin(I2C_SDA, I2C_SCL);
-  Wire1.setClock(400000);
+  beginJoyBus();
   delay(200);
 
-  calibrateCenter();
+  // Stick centres are calibrated in loop() from readings taken while the sticks
+  // rest (controller_logic.h stickCalAdd); nothing is sent until then.
   setupEspNow();
-
-  // Distinguish a dead radio from merely out-of-range: both otherwise show only
-  // OFFLINE. peerAdded is false on either init or add_peer failure. The banner
-  // persists — with no peer, loop() never sends, so no ack ever redraws status.
-  if (!peerAdded) {
-    M5.Display.fillRect(0, 16, 128, 16, TFT_RED);
-    M5.Display.setTextColor(TFT_WHITE, TFT_RED);
-    M5.Display.setTextDatum(middle_center);
-    M5.Display.setTextSize(2);
-    M5.Display.drawString("NO RADIO", 64, 24);
-  }
+  refreshDisplay(millis(), nullptr);
 }
 
-static uint32_t lastSendMs = 0;
-static uint32_t lastLogMs  = 0;
-static uint32_t seq        = 0;
+static uint32_t lastSendMs  = 0;
+static uint32_t lastLogMs   = 0;
 static uint8_t  lastBtnMask = 0;
 
 void loop() {
@@ -274,43 +307,104 @@ void loop() {
   if (now - lastSendMs < SEND_INTERVAL_MS) return;
   lastSendMs = now;
 
-  uint16_t lHoriz, lVert, rHoriz, rVert;
+  uint16_t raw[4];   // AX_LH, AX_LV, AX_RH, AX_RV
   uint8_t  btns[4] = { 1, 1, 1, 1 };
-  bool ok = readStick(REG_STICK_LEFT_PHYS,  &lHoriz, &lVert) &&
-            readStick(REG_STICK_RIGHT_PHYS, &rHoriz, &rVert) &&
+  bool ok = readStick(REG_STICK_LEFT_PHYS,  &raw[AX_LH], &raw[AX_LV]) &&
+            readStick(REG_STICK_RIGHT_PHYS, &raw[AX_RH], &raw[AX_RV]) &&
             readButtons(btns);
-  if (!ok) return;
+
+  // Joystick bus fault. A few failed reads are skipped (the robot holds the last
+  // command, inside its 500 ms watchdog). Past JOY_FAIL_TRIP (~100 ms): disarm,
+  // send e-stop frames so the robot stops now rather than at its watchdog, show
+  // JOY ERR, and re-initialize the bus every JOY_REINIT_MS until it answers.
+  // Recovery requires re-arming at neutral sticks.
+  if (!ok) {
+    if (joyFails < 0xFFFF) joyFails++;
+    if (joyFails >= JOY_FAIL_TRIP) {
+      if (joyFails == JOY_FAIL_TRIP) Serial.println("JOY ERR: joystick I2C not answering");
+      armed     = false;
+      estopHeld = false;
+      sendPacket(0, 0, 0, 0, ctrlFlagsFromPreset(MODE_PRESETS[modeIdx].disableBits, true));
+      if (now - lastReinitMs >= JOY_REINIT_MS) {
+        lastReinitMs = now;
+        Wire1.end();
+        beginJoyBus();
+      }
+    }
+    refreshDisplay(now, nullptr);
+    return;
+  }
+  if (joyFails >= JOY_FAIL_TRIP) Serial.println("JOY ERR cleared");
+  joyFails = 0;
+
+  // Stick centre: only from a set of readings taken at rest near mid-scale.
+  // Until then nothing is sent (the robot is stopped by its own watchdog).
+  if (!calibrated) {
+    int r = stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_NOMINAL, CENTER_TOL, CENTER_SPREAD, center);
+    if (r > 0) {
+      calibrated = true;
+      Serial.printf("Centers: L=(h%u,v%u) R=(h%u,v%u)\n",
+                    center[AX_LH], center[AX_LV], center[AX_RH], center[AX_RV]);
+    } else if (r < 0) {
+      Serial.printf("calibration rejected (stick held or moving): L=(h%u,v%u) R=(h%u,v%u)\n",
+                    raw[AX_LH], raw[AX_LV], raw[AX_RH], raw[AX_RV]);
+    }
+    refreshDisplay(now, nullptr);
+    return;
+  }
 
   // Buttons: 0 = pressed
   uint8_t btnMask = 0;
-  if (btns[0] == 0) btnMask |= 0x01;  // LeftBtn  (yellow L, top)  = decrease speed
-  if (btns[1] == 0) btnMask |= 0x02;  // RightBtn (yellow R, top)  = increase speed
-  if (btns[2] == 0) btnMask |= 0x04;  // LeftJoyBtn (stick press)
-  if (btns[3] == 0) btnMask |= 0x08;  // RightJoyBtn (stick press)
+  if (btns[0] == 0) btnMask |= BTN_LEFT;   // yellow L (top) = decrease speed
+  if (btns[1] == 0) btnMask |= BTN_RIGHT;  // yellow R (top) = increase speed
+  if (btns[2] == 0) btnMask |= BTN_LJOY;   // left stick press
+  if (btns[3] == 0) btnMask |= BTN_RJOY;   // right stick press
 
   // Edge-triggered speed adjust on top buttons
   uint8_t pressed = btnMask & ~lastBtnMask;
-  if (pressed & 0x02) speedPct = (speedPct >= 100)         ? 100        : speedPct + SPEED_STEP;
-  if (pressed & 0x01) speedPct = (speedPct <= SPEED_STEP)  ? SPEED_STEP : speedPct - SPEED_STEP;
-  // Left joystick-click cycles the feature-mode preset — but NOT while RightJoyBtn
-  // is also held (that combo is the e-stop), so reaching for e-stop never cycles.
-  if ((pressed & 0x04) && !(btnMask & 0x08)) modeIdx = (modeIdx + 1) % NMODES;
+  if (pressed & BTN_RIGHT) speedPct = (speedPct >= 100)        ? 100        : speedPct + SPEED_STEP;
+  if (pressed & BTN_LEFT)  speedPct = (speedPct <= SPEED_STEP) ? SPEED_STEP : speedPct - SPEED_STEP;
+  // Left stick click cycles the feature mode on RELEASE, unless the right click
+  // joined it (that is the e-stop gesture) — controller_logic.h modeClickStep.
+  if (modeClickStep(&modeClick, btnMask, lastBtnMask)) modeIdx = (modeIdx + 1) % NMODES;
   lastBtnMask = btnMask;
+  estopHeld = (btnMask & BTN_ESTOP) == BTN_ESTOP;
+
+  // Disarmed (and not e-stopping): keep calibrating in the background and move
+  // each axis centre only toward mid-scale (controller_logic.h centerImprove), so
+  // a centre caught off a lightly held stick can't leave the controller stuck on
+  // CENTER, and a stick held now can't become the centre.
+  if (!armed && !estopHeld) {
+    uint16_t cand[4];
+    if (stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_NOMINAL, CENTER_TOL, CENTER_SPREAD, cand) > 0 &&
+        centerImprove(center, cand, CENTER_NOMINAL)) {
+      Serial.printf("Centers refined: L=(h%u,v%u) R=(h%u,v%u)\n",
+                    center[AX_LH], center[AX_LV], center[AX_RH], center[AX_RV]);
+    }
+  } else {
+    cal.n = 0;   // restart cleanly next time it disarms
+  }
 
   // Normalize stick deflections to [-1000..+1000]. Names reflect actual physical axes.
-  int16_t lHorizN = normalize(lHoriz, centerLHoriz);
-  int16_t lVertN  = normalize(lVert,  centerLVert);
-  int16_t rHorizN = normalize(rHoriz, centerRHoriz);
-  int16_t rVertN  = normalize(rVert,  centerRVert);
+  int16_t lHorizN = normalize(raw[AX_LH], center[AX_LH]);
+  int16_t lVertN  = normalize(raw[AX_LV], center[AX_LV]);
+  int16_t rHorizN = normalize(raw[AX_RH], center[AX_RH]);
+  int16_t rVertN  = normalize(raw[AX_RV], center[AX_RV]);
+
+  // Arming: the e-stop disarms; re-arm only once it is released AND every axis
+  // is neutral. Disarmed = e-stop flag on every frame (latched e-stop), so letting
+  // go of the clicks with a stick still pushed does not launch the cart.
+  bool wasArmed = armed;
+  armed = armStep(armed, estopHeld, sticksNeutral(lHorizN, lVertN, rHorizN, rVertN));
+  if (armed != wasArmed) Serial.println(armed ? "ARMED" : "DISARMED (center sticks to re-arm)");
 
   // Stick -> robot mapping.
   //   LEFT  stick: VERT (UP=fwd)    -> vx primary
   //                HORIZ (RIGHT=R)  -> vy (strafe right)
   //   RIGHT stick: VERT (UP=fwd)    -> vx add (both stick verts sum)
   //                HORIZ (RIGHT=CW) -> omega (CW = negative; protocol: omega>0 CCW)
-  // normalize() returns +DOWN / +RIGHT (see lines 193-195), so UP requires negation.
-  // Base mapping (normalize() = +DOWN/+RIGHT, so UP=fwd requires negation).
-  // Per-axis inversion via INVERT_* toggles in config_controller.h.
+  // normalize() returns +DOWN / +RIGHT (see vertLabel/horizLabel), so UP requires
+  // negation. Per-axis inversion via INVERT_* toggles in config_controller.h.
   const int sVx = INVERT_VX ? -1 : 1, sVy = INVERT_VY ? -1 : 1, sW = INVERT_OMEGA ? -1 : 1;
   int16_t vy_raw    = (int16_t)(sVy *  lHorizN);
   int16_t omega_raw = (int16_t)(sW  * -rHorizN);
@@ -328,41 +422,22 @@ void loop() {
   int16_t vx    = (int16_t)(applyCurve(vx_raw,    CURVE)       * scale * 1000.0f);
   int16_t vy    = (int16_t)(applyCurve(vy_raw,    CURVE)       * scale * 1000.0f);
   int16_t omega = (int16_t)(applyCurve(omega_raw, CURVE_OMEGA) * scale * 1000.0f);
+  if (!armed) vx = vy = omega = 0;
 
-  // Flags: e-stop (both joystick clicks held) ORed with the active preset's
-  // feature DISABLE bits. flags==0 (FULL, no estop) = all robot features ON.
-  uint8_t flags = ctrlFlagsFromPreset(MODE_PRESETS[modeIdx].disableBits,
-                                      (btnMask & 0x0C) == 0x0C);
+  // Flags: e-stop (disarmed) ORed with the active preset's feature DISABLE bits.
+  // flags==0 (FULL, armed) = all robot features ON.
+  uint8_t flags = ctrlFlagsFromPreset(MODE_PRESETS[modeIdx].disableBits, !armed);
+  sendPacket(vx, vy, omega, btnMask, flags);
 
-  CtrlPacket pkt = { ++seq, vx, vy, omega, btnMask, flags, 0 };
-  pkt.crc = crc8((const uint8_t*)&pkt, offsetof(CtrlPacket, crc));  // integrity (#4)
-  if (peerAdded) esp_now_send(ROBOT_MAC, (uint8_t*)&pkt, sizeof(pkt));
-
-  // Display refresh @ ~10Hz: status/speed only on change, sticks every tick.
-  if (now - lastDispMs >= 100) {
-    lastDispMs = now;
-    bool connected = (now - lastAckMs) < 500;
-    if (connected != lastConnected) {
-      drawStatus(connected);
-      lastConnected = connected;
-    }
-    if (speedPct != lastSpeedPct) {
-      drawSpeedCompact(speedPct);
-      lastSpeedPct = speedPct;
-    }
-    if (modeIdx != lastModeIdx) {
-      drawMode(modeIdx);
-      lastModeIdx = modeIdx;
-    }
-    drawSticks(lVertN, lHorizN, rVertN, rHorizN);
-  }
+  const int16_t sticks[4] = { lVertN, lHorizN, rVertN, rHorizN };
+  refreshDisplay(now, sticks);
 
   // Serial log @ 5Hz
   if (now - lastLogMs >= 200) {
     lastLogMs = now;
-    Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
-                  (unsigned long)seq, speedPct, MODE_PRESETS[modeIdx].name, btnMask,
+    Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X armed=%d conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
+                  (unsigned long)seq, speedPct, MODE_PRESETS[modeIdx].name, btnMask, armed ? 1 : 0,
                   (now - lastAckMs) < 500 ? 1 : 0,
-                  lHoriz, lVert, rHoriz, rVert, vx, vy, omega);
+                  raw[AX_LH], raw[AX_LV], raw[AX_RH], raw[AX_RV], vx, vy, omega);
   }
 }
