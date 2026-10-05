@@ -8,14 +8,14 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Cache PlatformIO
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.platformio
@@ -31,8 +31,9 @@ jobs:
         run: pio test -e native
 
       # Compile firmware. No secrets.h on a fresh checkout — protocol.h falls back
-      # to a default MAC, ESPNOW_ENCRYPT defaults 0, so both build clean.
-      # headset env is omitted on purpose: it's an untracked draft, not in the repo.
+      # to a default MAC, ESPNOW_ENCRYPT defaults 0, so both build clean. The ESP32
+      # platform is pinned in platformio.ini ([esp32]); CI needs that pin.
+      # headset env is omitted on purpose: it's parked, and its platform is not pinned.
       - name: Build robot firmware
         run: pio run -e robot
 
