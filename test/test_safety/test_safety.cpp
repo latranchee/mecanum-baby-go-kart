@@ -190,24 +190,130 @@ static void test_gate_test_mode_ignores_link_latch(void) {
   TEST_ASSERT_FALSE(g.linkLatch);
 }
 
-static void test_gate_fault_clears_only_after_neutral_window(void) {
-  DriveGate g = { false, false, 0 };
-  driveGateTrip(&g, 0);
-  TEST_ASSERT_TRUE(driveGateStep(&g, gIn(true, false, false), 500, 1000).stop);  // held: restarts window
-  TEST_ASSERT_TRUE(driveGateStep(&g, gIn(true, false, true), 600, 1000).stop);   // neutral from 500
-  TEST_ASSERT_TRUE(driveGateStep(&g, gIn(true, false, true), 1499, 1000).stop);  // 999 ms
-  DriveGateOut o = driveGateStep(&g, gIn(true, false, true), 1500, 1000);        // 1000 ms
-  TEST_ASSERT_TRUE(o.faultCleared);
-  TEST_ASSERT_FALSE(o.stop);
-}
-
-static void test_gate_fault_not_cleared_without_link(void) {
-  // Neutral-looking but stale frames (link lost) never clear a fault.
+static void test_gate_wheel_fault_does_not_stop_the_drive(void) {
+  // Olivier 2026-10-05: a faulted wheel is switched off and reported; the other
+  // wheels keep driving. The gate must not stop the drive for it.
   DriveGate g = { false, false, 0 };
   driveGateTrip(&g, 0);
   for (uint32_t t = 0; t <= 3000; t += 100)
-    TEST_ASSERT_TRUE(driveGateStep(&g, gIn(false, false, true), t, 1000).stop);
+    TEST_ASSERT_FALSE(driveGateStep(&g, gIn(true, false, false), t, 1000).stop);  // stick held
+  TEST_ASSERT_TRUE(g.fault);   // still latched: the wheel stays off while driving
+}
+
+static void test_gate_fault_rearms_only_after_neutral_window(void) {
+  DriveGate g = { false, false, 0 };
+  driveGateTrip(&g, 0);
+  TEST_ASSERT_FALSE(driveGateStep(&g, gIn(true, false, false), 500, 1000).faultCleared); // held: restarts window
+  TEST_ASSERT_FALSE(driveGateStep(&g, gIn(true, false, true), 600, 1000).faultCleared);  // neutral from 500
+  TEST_ASSERT_FALSE(driveGateStep(&g, gIn(true, false, true), 1499, 1000).faultCleared); // 999 ms
+  DriveGateOut o = driveGateStep(&g, gIn(true, false, true), 1500, 1000);                // 1000 ms
+  TEST_ASSERT_TRUE(o.faultCleared);
+  TEST_ASSERT_FALSE(g.fault);
+}
+
+static void test_gate_fault_not_cleared_without_link(void) {
+  // Neutral-looking but stale frames (link lost) never re-arm a wheel.
+  DriveGate g = { false, false, 0 };
+  driveGateTrip(&g, 0);
+  for (uint32_t t = 0; t <= 3000; t += 100)
+    TEST_ASSERT_TRUE(driveGateStep(&g, gIn(false, false, true), t, 1000).stop);   // link down
   TEST_ASSERT_TRUE(g.fault);
+}
+
+// ---------------- WheelRecovery ----------------
+static const WheelRecoveryCfg RCFG = { FAULT_RETRY_FIRST_MS, FAULT_RETRY_MAX_MS,
+                                       FAULT_RETRY_RESET_MS, FAULT_TPS, FAULT_ROLL_MS };
+
+// Step an off wheel (not rolling) until it re-arms; returns the ms it took.
+static uint32_t untilRearm(WheelRecovery* r, uint32_t start, int* why) {
+  for (uint32_t t = start; t < start + 60000; t += 10) {
+    int w = wheelRecoveryStep(r, t, 0.0f, 10.0f, RCFG);
+    if (w) { *why = w; return t - start; }
+  }
+  *why = 0;
+  return 0;
+}
+
+static void test_recovery_comes_back_while_driving(void) {
+  // THE REGRESSION (Olivier 2026-10-05): "once it's declared dead it doesn't come
+  // back ever". A switched-off wheel is retried after FAULT_RETRY_FIRST_MS with no
+  // operator action at all.
+  WheelRecovery r = {};
+  wheelRecoveryTrip(&r, 1000, RCFG);
+  int why = 0;
+  TEST_ASSERT_UINT32_WITHIN(10, FAULT_RETRY_FIRST_MS, untilRearm(&r, 1000, &why));
+  TEST_ASSERT_EQUAL_INT(2, why);
+}
+
+static void test_recovery_backoff_doubles_then_caps(void) {
+  // A dead encoder re-trips right after every retry: delays 1, 2, 4, 8, 8 s.
+  WheelRecovery r = {};
+  uint32_t t = 0;
+  const uint32_t expect[] = { 1000, 2000, 4000, 8000, 8000 };
+  for (uint32_t e : expect) {
+    wheelRecoveryTrip(&r, t, RCFG);
+    int why = 0;
+    uint32_t took = untilRearm(&r, t, &why);
+    TEST_ASSERT_UINT32_WITHIN(10, e, took);
+    t += took;
+    wheelRecoveryRearm(&r, t);
+    t += 400;                                 // re-trips ~0.4 s after the retry
+  }
+}
+
+static void test_recovery_backoff_resets_after_healthy_run(void) {
+  WheelRecovery r = {};
+  wheelRecoveryTrip(&r, 0, RCFG);
+  int why = 0;
+  uint32_t t = untilRearm(&r, 0, &why);
+  wheelRecoveryRearm(&r, t);
+  wheelRecoveryTrip(&r, t + 400, RCFG);       // quick re-trip: 2 s
+  TEST_ASSERT_EQUAL_UINT32(2000, r.delayMs);
+  t += 400 + untilRearm(&r, t + 400, &why);
+  wheelRecoveryRearm(&r, t);
+  wheelRecoveryTrip(&r, t + FAULT_RETRY_RESET_MS + 100, RCFG);   // healthy long enough
+  TEST_ASSERT_EQUAL_UINT32(FAULT_RETRY_FIRST_MS, r.delayMs);
+}
+
+static void test_recovery_free_roll_rearms_at_once(void) {
+  // On the floor a freed wheel rolls with the cart while unpowered: that proves it
+  // is no longer jammed AND its encoder works. Back on after FAULT_ROLL_MS.
+  WheelRecovery r = {};
+  wheelRecoveryTrip(&r, 0, RCFG);
+  int why = 0;
+  uint32_t t = 0;
+  for (; t < 1000; t += 10) {
+    why = wheelRecoveryStep(&r, t, 600.0f, 10.0f, RCFG);
+    if (why) break;
+  }
+  TEST_ASSERT_EQUAL_INT(1, why);
+  TEST_ASSERT_TRUE(t <= (uint32_t)FAULT_ROLL_MS + 10);
+}
+
+static void test_recovery_ignores_jitter(void) {
+  // +-1 count jitter (100 tps) on a jammed wheel is not "rolling freely".
+  WheelRecovery r = {};
+  wheelRecoveryTrip(&r, 0, RCFG);
+  for (uint32_t t = 0; t < 900; t += 10)
+    TEST_ASSERT_EQUAL_INT(0, wheelRecoveryStep(&r, t, (t / 10) & 1 ? 100.0f : -100.0f, 10.0f, RCFG));
+}
+
+// ---------------- faultLabel ----------------
+
+static void test_fault_label_rider_names(void) {
+  char b[24];
+  faultLabel(0x00, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("", b);
+  faultLabel(0x01, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("FAULT RR", b);   // slot 0 = rider RR
+  faultLabel(0x08, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("FAULT FL", b);   // slot 3 = rider FL
+  faultLabel(0x05, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("FAULT RR FR", b);
+  faultLabel(0x0F, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("FAULT RR RL FR FL", b);
+  faultLabel(0xF0, b, sizeof(b)); TEST_ASSERT_EQUAL_STRING("", b);           // only 4 slots exist
+}
+
+static void test_fault_label_truncates_safely(void) {
+  char b[9];
+  faultLabel(0x0F, b, sizeof(b));
+  TEST_ASSERT_EQUAL_STRING("FAULT RR", b);   // 8 chars + NUL, never overruns
 }
 
 static void test_gate_encoders_down_always_stops(void) {
@@ -393,8 +499,16 @@ int main(void) {
   RUN_TEST(test_gate_link_loss_needs_neutral_to_resume);
   RUN_TEST(test_gate_estop_releases_link_latch);
   RUN_TEST(test_gate_test_mode_ignores_link_latch);
-  RUN_TEST(test_gate_fault_clears_only_after_neutral_window);
+  RUN_TEST(test_gate_wheel_fault_does_not_stop_the_drive);
+  RUN_TEST(test_gate_fault_rearms_only_after_neutral_window);
   RUN_TEST(test_gate_fault_not_cleared_without_link);
+  RUN_TEST(test_recovery_comes_back_while_driving);
+  RUN_TEST(test_recovery_backoff_doubles_then_caps);
+  RUN_TEST(test_recovery_backoff_resets_after_healthy_run);
+  RUN_TEST(test_recovery_free_roll_rearms_at_once);
+  RUN_TEST(test_recovery_ignores_jitter);
+  RUN_TEST(test_fault_label_rider_names);
+  RUN_TEST(test_fault_label_truncates_safely);
   RUN_TEST(test_gate_encoders_down_always_stops);
   RUN_TEST(test_cal_collecting_returns_zero);
   RUN_TEST(test_cal_accepts_sticks_at_rest);

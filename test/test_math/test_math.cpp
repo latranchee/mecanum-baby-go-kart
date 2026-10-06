@@ -410,6 +410,43 @@ static void test_fwd_null_mode_is_slip(void) {
   TEST_ASSERT_FLOAT_WITHIN(1.0f, 1000.0f, s);
 }
 
+static void test_fill_dead_wheel_recovers_twist(void) {
+  // One wheel switched off: the other three must still give back the exact twist
+  // the wheels were commanded, for every slot and a spread of twists (incl. pure
+  // spin and diagonals). The dead slot holds garbage before the fill.
+  const int16_t twists[][3] = {
+    { 600, 0, 0 }, { 0, 600, 0 }, { 0, 0, 600 }, { 400, -300, 200 },
+    { -500, 250, -150 }, { 300, 300, 300 }, { -200, -700, 50 } };
+  for (const auto& t : twists) {
+    int32_t c[4];
+    mecanumMix(t[0], t[1], t[2], c);
+    for (int dead = 0; dead < 4; dead++) {
+      float m[4] = { (float)c[0], (float)c[1], (float)c[2], (float)c[3] };
+      m[dead] = 12345.0f;                       // a dead/undriven wheel's reading
+      fillDeadWheel(m, dead);
+      float vx, vy, w, s;
+      forwardKinematics(m, 1000.0f, &vx, &vy, &w, &s);
+      int32_t evx, evy, ew;
+      mixInverse(c, &evx, &evy, &ew);           // the twist actually commanded
+      TEST_ASSERT_FLOAT_WITHIN(1.0f, (float)evx, vx);
+      TEST_ASSERT_FLOAT_WITHIN(1.0f, (float)evy, vy);
+      TEST_ASSERT_FLOAT_WITHIN(1.0f, (float)ew,  w);
+      TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.0f, s);  // zero slip by construction
+    }
+  }
+}
+
+static void test_fill_dead_wheel_sees_live_wheel_yaw(void) {
+  // Heading hold with a dead corner must still see a real yaw from the live
+  // wheels. Pure forward on the 3 live wheels except FR (slot 1) lagging 20%: the
+  // estimate must report a nonzero yaw (the dead slot can't hide it).
+  float m[4] = { 1000.0f, 800.0f, 1000.0f, 0.0f };   // slot 3 dead
+  fillDeadWheel(m, 3);
+  float vx, vy, w, s;
+  forwardKinematics(m, 1000.0f, &vx, &vy, &w, &s);
+  TEST_ASSERT_TRUE(w < -50.0f || w > 50.0f);
+}
+
 static void test_fwd_uniform_ref_weak_wheel_reports_low(void) {
   // All four commanded forward but FL only reaches 0.8*ref -> recovered vx < 1000
   // (the curve a per-wheel-max normalization would hide). vy/omega pick up the
@@ -533,13 +570,33 @@ static void test_body_yawhold_active_through_modest_turn(void) {
 }
 
 static void test_body_correction_rate_limited(void) {
-  // One tick from rest with a huge error: output bounded by rateLimit*dt.
+  // One tick from a clean state with a huge yaw error while translating: the
+  // output is bounded by rateLimit*dt, and it really is moving (not zero).
   BodyLoopState st = {};
   BodyLoopCfg c = body_cfg();
   float dvx, dvy, dw;
-  bodyCorrection(0, 0, 0, 0, 0, 5000, false, 1.0f, 0.0f, 0.01f, &c, &st, &dvx, &dvy, &dw);
+  bodyCorrection(300, 0, 0, 300, 0, 5000, false, 1.0f, 0.0f, 0.01f, &c, &st, &dvx, &dvy, &dw);
   float adw = dw < 0 ? -dw : dw;
   TEST_ASSERT_TRUE(adw <= c.rateLimit * 0.01f + 0.001f);   // <= 4 cmd units
+  TEST_ASSERT_TRUE(adw > 1.0f);
+}
+
+static void test_body_standstill_outputs_nothing(void) {
+  // THE REGRESSION (bench 2026-10-05): after a drive the yaw integral kept its
+  // value with the sticks centred and emitted a +-1 correction at rest; the wheel
+  // PI loops cannot reach a 1-unit target, so PWM crept up ~2/s until the cart
+  // twitched into a spin by itself. Zero commanded twist = zero correction, and
+  // the integrals are cleared so the next drive starts clean.
+  BodyLoopState st = {};
+  BodyLoopCfg c = body_cfg();
+  float dvx, dvy, dw;
+  body_settle(&st, &c, 500, 0, 0, 500, 0, 100, false, 1.0f, &dvx, &dvy, &dw);  // wind up
+  TEST_ASSERT_TRUE(bl_abs(st.iw) > 1.0f);
+  bodyCorrection(0, 0, 0, 0, 0, 3, false, 1.0f, 0.0f, 0.01f, &c, &st, &dvx, &dvy, &dw);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, dw);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, dvx);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, dvy);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, st.iw);
 }
 
 static void test_body_curve_under_uniform_sag_no_phantom_yaw(void) {
@@ -764,6 +821,33 @@ static void test_packet_wire_size(void) {
   TEST_ASSERT_EQUAL_UINT32(13, (uint32_t)sizeof(CtrlPacket));
 }
 
+static void test_status_packet_roundtrip(void) {
+  StatusPacket p = statusPacketMake(7, 0x05, STATUS_FLAG_LINK_LATCH | STATUS_FLAG_TEST_MODE);
+  StatusPacket q;
+  TEST_ASSERT_TRUE(statusPacketParse((const uint8_t*)&p, sizeof(p), &q));
+  TEST_ASSERT_EQUAL_UINT8(7, q.seq);
+  TEST_ASSERT_EQUAL_UINT8(0x05, q.faultMask);
+  TEST_ASSERT_EQUAL_UINT8(STATUS_FLAG_LINK_LATCH | STATUS_FLAG_TEST_MODE, q.flags);
+  TEST_ASSERT_EQUAL_UINT32(5, (uint32_t)sizeof(StatusPacket));
+  TEST_ASSERT_EQUAL_UINT8(0x0F, statusPacketMake(0, 0xFF, 0).faultMask);   // 4 slots only
+}
+
+static void test_status_packet_rejects_bad_frames(void) {
+  StatusPacket p = statusPacketMake(1, 0x01, 0);
+  StatusPacket q;
+  uint8_t b[sizeof(p)];
+  memcpy(b, &p, sizeof(p));
+  b[2] ^= 0x02;                                                    // corrupted mask
+  TEST_ASSERT_FALSE(statusPacketParse(b, sizeof(b), &q));
+  memcpy(b, &p, sizeof(p));
+  b[0] = 0x00;                                                     // wrong magic
+  b[4] = crc8(b, 4);
+  TEST_ASSERT_FALSE(statusPacketParse(b, sizeof(b), &q));
+  TEST_ASSERT_FALSE(statusPacketParse((const uint8_t*)&p, 4, &q));  // wrong length
+  CtrlPacket c = { 1, 0, 0, 0, 0, 0, 0 };                          // a control frame
+  TEST_ASSERT_FALSE(statusPacketParse((const uint8_t*)&c, sizeof(c), &q));
+}
+
 static void test_ctrl_flags_from_preset(void) {
   // FULL preset (no disable bits, no estop) MUST be 0 — the legacy-safe value a
   // headset or un-updated sender emits, meaning "all features ON".
@@ -821,6 +905,8 @@ int main(void) {
   RUN_TEST(test_fwd_pure_rotate);
   RUN_TEST(test_fwd_null_mode_is_slip);
   RUN_TEST(test_fwd_uniform_ref_weak_wheel_reports_low);
+  RUN_TEST(test_fill_dead_wheel_recovers_twist);
+  RUN_TEST(test_fill_dead_wheel_sees_live_wheel_yaw);
   RUN_TEST(test_body_zero_error_zero_corr);
   RUN_TEST(test_body_yaw_during_translation);
   RUN_TEST(test_body_trans_during_rotation);
@@ -828,6 +914,7 @@ int main(void) {
   RUN_TEST(test_body_governor_scales_both_trans_and_yaw);
   RUN_TEST(test_body_yawhold_active_through_modest_turn);
   RUN_TEST(test_body_correction_rate_limited);
+  RUN_TEST(test_body_standstill_outputs_nothing);
   RUN_TEST(test_body_curve_under_uniform_sag_no_phantom_yaw);
   RUN_TEST(test_body_yaw_clamped_relative_to_throttled_forward);
   RUN_TEST(test_body_freeze_drops_proportional_yaw);
@@ -851,5 +938,7 @@ int main(void) {
   RUN_TEST(test_crc8_detects_corruption);
   RUN_TEST(test_packet_wire_size);
   RUN_TEST(test_ctrl_flags_from_preset);
+  RUN_TEST(test_status_packet_roundtrip);
+  RUN_TEST(test_status_packet_rejects_bad_frames);
   return UNITY_END();
 }

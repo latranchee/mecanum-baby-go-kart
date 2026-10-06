@@ -197,9 +197,14 @@ static const float STALL_MS       = 300.0f;  // sustained for this long
 
 // Drive fault (safety.h driveFaultStep): a wheel at or above FAULT_PWM_FRAC of
 // PWM_MAX that measures under FAULT_TPS ticks/s for FAULT_MS = dead encoder or
-// jammed wheel. Every motor stops and the fault LATCHES (safety.h DriveGate): it
-// clears after FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live link, or
-// `r`/`x` on the bench.
+// jammed wheel. THAT wheel's power is cut (a jam may be a hand or a foot, so it is
+// switched off rather than driven blind) and the other wheels keep driving: they
+// still run the exact speeds the twist needs, the governor ignores the dead wheel,
+// and heading hold estimates the motion from the live wheels (kinematics.h
+// fillDeadWheel; paused with 2+ wheels off). The robot reports the dead wheel to
+// the controller (StatusPacket) and the fault LATCHES (safety.h DriveGate): the
+// wheel is re-armed after FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live
+// link, or `r`/`x` on the bench.
 // FAULT_TPS is ABSOLUTE, the same for every wheel: 150 ticks/s = 1.5 counts per
 // 10 ms tick, so a jammed wheel jittering +-1 count still counts as stopped, while
 // any wheel actually rolling clears it. It used to be 2% of each wheel's own
@@ -211,12 +216,26 @@ static const float    FAULT_PWM_FRAC = 0.30f;
 static const float    FAULT_TPS      = 150.0f;
 static const float    FAULT_MS       = 300.0f;
 static const uint32_t FAULT_CLEAR_MS = 1000;
+// Automatic re-arm while driving (safety.h WheelRecovery): a switched-off wheel
+// seen rolling freely for FAULT_ROLL_MS comes back at once; otherwise it is
+// retried after FAULT_RETRY_FIRST_MS, doubling on each quick re-trip up to
+// FAULT_RETRY_MAX_MS, reset after FAULT_RETRY_RESET_MS of healthy running.
+// A jammed wheel (possibly a hand or foot) therefore gets a short power pulse at
+// each retry (<= FAULT_MS plus the PWM ramp, ~0.4 s) before it re-trips.
+static const uint32_t FAULT_RETRY_FIRST_MS = 1000;
+static const uint32_t FAULT_RETRY_MAX_MS   = 8000;
+static const uint32_t FAULT_RETRY_RESET_MS = 5000;
+static const float    FAULT_ROLL_MS        = 100.0f;
 
 // Link watchdog: stop motors if no fresh packet for this long. Also the silence
 // after which the receive gate reopens for a rebooted/other controller (safety.h).
 // A link loss also LATCHES the drive (safety.h DriveGate): it resumes only after a
 // neutral (or e-stop) frame, so a flaky link can't relaunch the cart at a held stick.
 static const uint32_t WATCHDOG_MS = 500;
+
+// Status back-channel period (protocol.h StatusPacket, robot -> controller).
+// The controller treats status older than 1 s as unknown.
+static const uint32_t STATUS_PERIOD_MS = 200;
 
 // Bench test mode (serial t/m commands) has no radio packets to feed the watchdog,
 // so it runs its own: if no serial line arrives for TEST_LINK_MS while a test is
