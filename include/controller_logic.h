@@ -1,5 +1,7 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
+#include "protocol.h"   // SLOT_RIDER_NAME, StatusPacket flags
 
 // Controller input logic: stick centre calibration, arming, mode-click gesture.
 // Pure, no Arduino deps — host-testable (test/test_safety).
@@ -100,6 +102,25 @@ static inline bool sticksNeutral(int16_t a, int16_t b, int16_t c, int16_t d) {
 static inline bool armStep(bool armed, bool estopHeld, bool neutral) {
   if (estopHeld) return false;
   return armed || neutral;
+}
+
+// ---------------- Robot fault label ----------------
+// Status-bar text for the robot's wheel-fault mask (StatusPacket.faultMask), in
+// the RIDER's corner names: "FAULT RR", "FAULT RR FL". Empty for mask 0. Always
+// NUL-terminated within n.
+static inline void faultLabel(uint8_t mask, char* buf, size_t n) {
+  if (n == 0) return;
+  buf[0] = '\0';
+  if (!(mask & 0x0F)) return;
+  size_t k = 0;
+  const char* head = "FAULT";
+  for (const char* p = head; *p && k + 1 < n; p++) buf[k++] = *p;
+  for (int i = 0; i < 4; i++) {
+    if (!(mask & (1u << i))) continue;
+    if (k + 1 < n) buf[k++] = ' ';
+    for (const char* p = SLOT_RIDER_NAME[i]; *p && k + 1 < n; p++) buf[k++] = *p;
+  }
+  buf[k] = '\0';
 }
 
 // ---------------- Mode-click gesture ----------------

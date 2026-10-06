@@ -26,7 +26,7 @@ valid frame from any transmitter, so a rebooted controller is picked up at once.
 |---|---|
 | No valid packet for 500 ms | Motors stop (link watchdog). **Latched**: driving resumes only after a neutral (or e-stop) frame, so a flaky link can't relaunch the cart at a held stick. Also true at boot |
 | E-stop flag | Motors stop and stay stopped while the flag is sent |
-| A wheel at ≥30% PWM turning under 150 ticks/s for 300 ms (dead encoder, jammed wheel) | **Drive fault**: all motors stop, `FAULT RR (slot 0) ...` on serial (rider's corner name). Clears after 1 s of neutral sticks on a live link, or `r`/`x` on the bench |
+| A wheel at ≥30% PWM turning under 150 ticks/s for 300 ms (dead encoder, jammed wheel) | **Wheel fault**: that wheel's power is cut, the other three keep driving (governor ignores the dead wheel; heading hold runs on the three live wheels). The controller blinks `FAULT RR` (rider's corner); serial prints `FAULT RR (slot 0) ...`. The wheel comes back by itself: at once if it is seen rolling freely, otherwise on a retry after 1 s, then 2, 4, 8 s (max) while it keeps failing; also after 1 s of neutral sticks, or `r`/`x` on the bench |
 | `loop()` hangs for 500 ms | Task watchdog: every direction pin driven LOW, then reboot |
 | Bench test: no serial line for 1 s while driving | Test stops (`k` is the keepalive) |
 | Bench test: radio e-stop | Test mode aborted, motors stopped |
@@ -40,8 +40,15 @@ The AtomS3 status bar shows one word, highest priority first:
 | `NO RADIO` | ESP-NOW init or peer add failed; nothing is sent |
 | `JOY ERR` | Joystick (I2C) not answering for 100 ms; e-stop frames sent, bus re-initialized every 500 ms |
 | `E-STOP` | Both stick clicks held |
-| `CENTER` | Not armed: release and centre both sticks |
-| `ONLINE` / `OFFLINE` | Armed; the robot's radio is / isn't acknowledging |
+| `CENTER` | Not armed, or the robot is waiting for neutral sticks after a link drop: release and centre both sticks |
+| `OFFLINE` | Armed, but the robot's radio isn't acknowledging |
+| `ENC ERR` | The robot's encoders failed to start; its drive is disabled |
+| `TEST MODE` | The robot is in serial bench mode and ignores the sticks |
+| `FAULT RR` (etc., blinking) | A wheel fault switched that wheel off; driving continues on the others. It is retried automatically and the screen clears when it is back |
+| `ONLINE` | Armed, robot acknowledging, nothing to report |
+
+The robot reports its state back to the controller 5 times a second (`StatusPacket`
+in `protocol.h`); status older than 1 s is treated as unknown.
 
 - **Stick centre** is taken from 16 readings at rest, accepted only within 45 counts
   of this joystick's measured rest position (`CENTER_REST` in `config_controller.h`).

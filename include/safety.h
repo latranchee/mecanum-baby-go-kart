@@ -76,11 +76,72 @@ static inline bool driveFaultStep(DriveFault* f, float pwm, float measTps,
   return f->ms >= tripMs;
 }
 
+// Wheel recovery: when a switched-off (faulted) wheel gets power back WITHOUT the
+// operator stopping. Olivier 2026-10-05: "once it's declared dead it doesn't come
+// back ever" — the neutral-sticks re-arm alone never fires while driving.
+//   - FREE ROLL: the unpowered wheel's encoder shows it turning (>= rollGate for
+//     rollMs): on the floor a freed wheel rolls with the cart, which proves both
+//     that it is no longer jammed and that its encoder works. Re-arm at once.
+//   - RETRY: otherwise re-arm after delayMs. Each trip shortly after a re-arm
+//     doubles the delay (first..max); a wheel that then runs healthy for
+//     healthyResetMs starts over at `first`. A truly dead encoder therefore costs a
+//     short re-trip (<= ~0.4 s of that wheel) at most every `max` ms.
+// The neutral-sticks re-arm (DriveGate) still re-arms everything at once.
+// Pure logic, host-tested.
+struct WheelRecovery {
+  bool     off;        // switched off by a drive fault
+  bool     everTripped;
+  uint32_t offAtMs;    // when it was (last) switched off
+  uint32_t armedAtMs;  // when it was last re-armed
+  uint32_t delayMs;    // current retry delay
+  float    rollMs;     // how long the unpowered wheel has been seen rolling
+};
+
+struct WheelRecoveryCfg {
+  uint32_t firstMs, maxMs, healthyResetMs;
+  float    rollGateTps, rollMs;
+};
+
+static inline void wheelRecoveryTrip(WheelRecovery* r, uint32_t nowMs, const WheelRecoveryCfg& c) {
+  const bool recent = r->everTripped && (uint32_t)(nowMs - r->armedAtMs) < c.healthyResetMs;
+  if (!recent)                 r->delayMs = c.firstMs;
+  else if (r->delayMs < c.maxMs) {
+    uint32_t d = r->delayMs * 2;
+    r->delayMs = d > c.maxMs ? c.maxMs : d;
+  }
+  r->off = true;
+  r->everTripped = true;
+  r->offAtMs = nowMs;
+  r->rollMs = 0.0f;
+}
+
+static inline void wheelRecoveryRearm(WheelRecovery* r, uint32_t nowMs) {
+  r->off = false;
+  r->armedAtMs = nowMs;
+  r->rollMs = 0.0f;
+}
+
+// Call every tick for an OFF wheel with its (unpowered) measured speed.
+// 0 = stay off, 1 = re-arm: rolling freely, 2 = re-arm: retry delay elapsed.
+static inline int wheelRecoveryStep(WheelRecovery* r, uint32_t nowMs, float measTps,
+                                    float dtMs, const WheelRecoveryCfg& c) {
+  if (!r->off) return 0;
+  const float am = measTps < 0 ? -measTps : measTps;
+  r->rollMs = am >= c.rollGateTps ? r->rollMs + dtMs : 0.0f;
+  if (r->rollMs >= c.rollMs) return 1;
+  if ((uint32_t)(nowMs - r->offAtMs) >= r->delayMs) return 2;
+  return 0;
+}
+
 // Drive gate: the single "may the motors run this tick?" decision, plus the two
 // latches that need neutral sticks to release.
 //
-//   fault     : set by driveGateTrip() when a drive fault trips. Clears after
-//               clearMs of neutral sticks (or e-stop) on a LIVE link.
+//   fault     : set by driveGateTrip() when a drive fault switches a wheel off.
+//               It does NOT stop the drive: the faulted wheel is switched off and
+//               the other wheels keep driving (Olivier, 2026-10-05: "show an error
+//               for that wheel, not stop the whole thing"). The latch only decides
+//               when the switched-off wheel(s) get re-armed: after clearMs of
+//               neutral sticks (or e-stop) on a LIVE link.
 //   linkLatch : set whenever the radio link is lost (watchdog). Clears on the
 //               first fresh frame that is neutral (or e-stop). Without it, a
 //               marginal link stopped and relaunched the cart at whatever the
@@ -104,8 +165,8 @@ struct DriveGateIn {
 };
 
 struct DriveGateOut {
-  bool stop;          // hold the motors stopped this tick
-  bool faultCleared;  // the fault latch released on this tick
+  bool stop;          // hold ALL motors stopped this tick (a wheel fault alone never does)
+  bool faultCleared;  // the fault latch released on this tick: re-arm the wheel(s)
   bool linkLatched;   // the link latch engaged on this tick
   bool linkReleased;  // the link latch released on this tick
 };
@@ -137,7 +198,7 @@ static inline DriveGateOut driveGateStep(DriveGate* g, const DriveGateIn& in,
     }
   }
 
-  o.stop = !in.encReady || !in.linkOk || in.estop || g->fault ||
+  o.stop = !in.encReady || !in.linkOk || in.estop ||
            (g->linkLatch && !in.testMode);
   return o;
 }

@@ -90,6 +90,18 @@ static inline void bodyCorrection(
     const BodyLoopCfg* cfg, BodyLoopState* st,
     float* dvx, float* dvy, float* dw) {
 
+  // STANDSTILL (bench find 2026-10-05): with no commanded twist there is nothing to
+  // hold. The integral otherwise kept its last value (eW ~ 0 at rest stops it
+  // changing) and kept emitting a +-1 yaw correction with the sticks centred; the
+  // wheel PI loops cannot reach a 1-unit target, so their PWM crept up ~2/s until
+  // the cart twitched into a slow spin on its own. Clear everything and output 0.
+  if (vx_c == 0.0f && vy_c == 0.0f && w_c == 0.0f) {
+    st->ix = st->iy = st->iw = 0.0f;
+    st->dvx = st->dvy = st->dw = 0.0f;
+    *dvx = *dvy = *dw = 0.0f;
+    return;
+  }
+
   // Continuous per-motion weight: rot~1 when rotating, ~0 when translating.
   float aw     = w_c < 0 ? -w_c : w_c;
   float rot    = bl_smoothstep(0.0f, cfg->wThresh, aw);

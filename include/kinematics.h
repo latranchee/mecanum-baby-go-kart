@@ -99,6 +99,24 @@ static inline void slewQuad(int32_t cur[4], const int32_t tgt[4], int32_t maxSte
 // NULL VECTOR for THIS mix is [-1,-1,+1,+1] (front pair vs rear pair), derived as
 // the orthogonal complement of {vx,vy,omega} columns. (It is NOT [+1,-1,+1,-1] —
 // that vector equals -omega, i.e. it would read nonzero on every normal rotation.)
+// Fill in ONE wheel's speed from the other three, assuming the null/slip
+// coordinate is zero (wheels not fighting): s = (-c0 - c1 + c2 + c3)/4 = 0.
+// Used when a drive fault has switched a wheel off: its encoder is either dead or
+// reading a wheel that is no longer driven, so its reading says nothing about the
+// chassis. Any 3 rows of the mix are independent, so the 3 live wheels fully
+// determine the twist; forwardKinematics() on the filled-in set is then the exact
+// 3-wheel inverse and heading hold keeps working on the live wheels. Works in any
+// consistent units (ticks/s or cmd units). dead outside 0..3 = no-op.
+static inline void fillDeadWheel(float c[4], int dead) {
+  switch (dead) {
+    case 0: c[0] = -c[1] + c[2] + c[3]; break;
+    case 1: c[1] = -c[0] + c[2] + c[3]; break;
+    case 2: c[2] =  c[0] + c[1] - c[3]; break;
+    case 3: c[3] =  c[0] + c[1] - c[2]; break;
+    default: break;
+  }
+}
+
 static inline void forwardKinematics(const float measTps[4], float refTps,
                                      float* vx, float* vy, float* omega, float* s) {
   if (refTps <= 0.0f) { *vx = *vy = *omega = *s = 0.0f; return; }

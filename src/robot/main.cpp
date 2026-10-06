@@ -223,15 +223,25 @@ static float lastOutPwm[4]    = { 0, 0, 0, 0 };
 static float stallMs[4]      = { 0, 0, 0, 0 };
 static bool  wheelStalled[4] = { false, false, false, false };
 
-// Drive fault (safety.h): driven hard with no encoder motion -> stop + latch.
+// Drive fault (safety.h): a wheel driven hard with no encoder motion is switched
+// off (latched) while the others keep driving. faultMask bit i = slot i is off.
 static DriveFault faultState[4] = {};
 static DriveGate  gate          = { false, true, 0 };  // link latched until the first neutral frame
-static uint8_t    faultMask     = 0;     // bit i = wheel i tripped (telemetry)
-// Slot names as the RIDER sees them. Slots are named in the firmware frame
-// (motors[] comments: FL FR RL RR), but the rider faces the firmware's rear
-// (config_controller.h INVERT_VX/VY; bench-confirmed 2026-10-05: slot 0 is the
-// rider's rear-right). Everything printed for a human uses these.
-static const char* const RIDER_NAME[4] = { "RR", "RL", "FR", "FL" };
+static uint8_t    faultMask     = 0;
+// Slot names as the RIDER sees them (protocol.h SLOT_RIDER_NAME): slots are named
+// in the firmware frame, but the rider faces the firmware's rear.
+#define RIDER_NAME SLOT_RIDER_NAME
+
+static int deadWheelCount() {
+  int n = 0;
+  for (int i = 0; i < 4; i++) if (faultMask & (1u << i)) n++;
+  return n;
+}
+
+// Automatic re-arm of a switched-off wheel while driving (safety.h WheelRecovery).
+static WheelRecovery recov[4] = {};
+static const WheelRecoveryCfg RECOV_CFG = { FAULT_RETRY_FIRST_MS, FAULT_RETRY_MAX_MS,
+                                            FAULT_RETRY_RESET_MS, FAULT_TPS, FAULT_ROLL_MS };
 
 // Wheel commands actually handed to pidStep last tick (after slew, governor and
 // body correction). Telemetry `cmd=` reports these, not the raw packet mix.
@@ -297,7 +307,8 @@ static inline uint8_t faultCheck(int i, float out, float measuredTps, float dt) 
 // caller; drives slew, integral and fault timing). dtMeas = the TRUE time the
 // encoder delta spans: measuring speed with the clamped dt read a 100 ms stall as
 // double speed and dipped PWM for a tick. Returns a mask of wheels whose drive
-// fault tripped this tick (0 = healthy); the caller stops everything.
+// fault tripped this tick (0 = healthy); the caller switches those wheels off.
+// Wheels already switched off (faultMask) are held at zero output here.
 static uint8_t pidStep(const int32_t cmd[4], float dt, float dtMeas) {
   uint8_t tripped = 0;
   for (int i = 0; i < 4; i++) {
@@ -317,6 +328,18 @@ static uint8_t pidStep(const int32_t cmd[4], float dt, float dtMeas) {
     if (delta >  maxDelta) delta =  maxDelta;
     if (delta < -maxDelta) delta = -maxDelta;
     float measuredTps = encSign[i] * (float)delta / dtMeas;
+
+    // Switched off by a drive fault: no power (coast/brake per the driver's L/L
+    // state), no integral, no fault timing. The measurement is still logged.
+    if (faultMask & (1u << i)) {
+      motorWrite(i, 0);
+      pid[i].integral  = 0.0f;
+      faultState[i].ms = 0.0f;
+      lastTargetTps[i] = 0;
+      lastMeasTps[i]   = measuredTps;
+      lastOutPwm[i]    = 0.0f;
+      continue;
+    }
 
     // Feed-forward is per-wheel (a weak-battery wheel needs more PWM per tick/sec),
     // but the TARGET is a UNIFORM absolute speed referenced to the weakest wheel
@@ -463,12 +486,25 @@ static int16_t clampPwm(int v) { return (int16_t)constrain(v, -PWM_MAX, PWM_MAX)
 static void setPacketFromTest(int16_t vx, int16_t vy, int16_t omega);
 static void getPacketSnapshot(CtrlPacket& out);
 
+// Bench reset (`r`/`x`): every wheel back on, recovery backoff forgotten.
 static void clearDriveFault(const char* why) {
   bool was = gate.fault;
   gate.fault = false;
   faultMask  = 0;
-  for (int i = 0; i < 4; i++) faultState[i].ms = 0.0f;
+  for (int i = 0; i < 4; i++) { faultState[i].ms = 0.0f; recov[i] = WheelRecovery{}; }
   if (was) Serial.printf("FAULT cleared (%s)\n", why);
+}
+
+// Give one switched-off wheel its power back (recovery or neutral sticks).
+static void rearmWheel(int i, uint32_t now, const char* why) {
+  if (!(faultMask & (1u << i))) return;
+  faultMask &= (uint8_t)~(1u << i);
+  wheelRecoveryRearm(&recov[i], now);
+  faultState[i].ms = 0.0f;
+  pid[i].integral  = 0.0f;
+  pid[i].lastCount = readCount(i);   // clean first delta
+  if (faultMask == 0) gate.fault = false;
+  Serial.printf("wheel %s (slot %d) re-armed (%s)\n", RIDER_NAME[i], i, why);
 }
 
 // Re-baseline every wheel's last count (PID + telemetry) to what readCount()
@@ -689,6 +725,8 @@ static volatile uint32_t crcDrops = 0;      // frames rejected on bad CRC
 static volatile uint32_t foreignDrops = 0;  // frames from a second transmitter
 static bool espNowReady = false;        // false until radio init + recv cb succeed
 static LinkGate linkGate = {};          // touched only from onRecv (WiFi task)
+static uint8_t  senderMac[6] = {};      // last accepted transmitter (under pktMux)
+static bool     senderKnown  = false;   // (under pktMux)
 
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len != sizeof(CtrlPacket)) return;
@@ -735,6 +773,8 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     lastPacket   = in;
     lastPacketMs = millis();
   }
+  memcpy(senderMac, info->src_addr, 6);   // status back-channel destination
+  senderKnown = true;
   portEXIT_CRITICAL(&pktMux);
 }
 
@@ -789,6 +829,43 @@ static void setupEspNow() {
   esp_now_register_recv_cb(onRecv);
   espNowReady = true;
   Serial.println("ESP-NOW listening");
+}
+
+// ---------------- Status back-channel (robot -> controller) ----------------
+// Every STATUS_PERIOD_MS, tell the transmitter the robot last accepted what it is
+// doing (protocol.h StatusPacket): which wheel a drive fault switched off, link
+// latch, test mode, encoder failure. The controller shows it instead of a bare
+// ONLINE. Best effort: a lost status frame is replaced 200 ms later.
+static void sendStatus(uint32_t now) {
+  static uint32_t lastMs = 0;
+  static uint8_t  seq    = 0;
+  if (!espNowReady || now - lastMs < STATUS_PERIOD_MS) return;
+  lastMs = now;
+
+  uint8_t mac[6];
+  bool known;
+  portENTER_CRITICAL(&pktMux);
+  known = senderKnown;
+  memcpy(mac, senderMac, 6);
+  portEXIT_CRITICAL(&pktMux);
+  if (!known) return;
+
+  if (!esp_now_is_peer_exist(mac)) {
+    // Plaintext peer. With ESPNOW_ENCRYPT the controller is already registered as
+    // an encrypted peer in setupEspNow (and onRecv only accepts that MAC).
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac, 6);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) != ESP_OK) return;
+  }
+
+  uint8_t flags = 0;
+  if (gate.linkLatch && !testMode) flags |= STATUS_FLAG_LINK_LATCH;
+  if (testMode)                    flags |= STATUS_FLAG_TEST_MODE;
+  if (!encReady)                   flags |= STATUS_FLAG_ENC_DOWN;
+  StatusPacket sp = statusPacketMake(seq++, faultMask, flags);
+  esp_now_send(mac, (const uint8_t*)&sp, sizeof(sp));
 }
 
 // ---------------- Loop watchdog ----------------
@@ -873,6 +950,7 @@ static void stopDrive() {
 void loop() {
   uint32_t now = millis();
   pollSerial();
+  sendStatus(now);
 
   // Surface a dead radio. The one-shot setup line scrolls away and the robot is
   // headless, so re-warn periodically — visible whenever serial is attached.
@@ -951,10 +1029,11 @@ void loop() {
     age = linkAgeMs(now, lastPacketMs);   // onRecv may stamp after `now` was read
     portEXIT_CRITICAL(&pktMux);
 
-    // Drive gate (safety.h): one decision for "may the motors run", with the fault
-    // latch (clears after FAULT_CLEAR_MS of neutral) and the link latch (after a
-    // link loss, the first frame obeyed must be neutral). Neutral = zero twist AND
-    // no direct-mode PWM, so `m` can't resume itself after a fault.
+    // Drive gate (safety.h): one decision for "may the motors run", the link latch
+    // (after a link loss, the first frame obeyed must be neutral) and the wheel-
+    // fault latch (a switched-off wheel is re-armed after FAULT_CLEAR_MS of
+    // neutral; the other wheels drive on meanwhile). Neutral = zero twist AND no
+    // direct-mode PWM.
     bool directPwm = false;
     if (testMode && testSrc == TS_DIRECT)
       for (int i = 0; i < 4; i++) if (slotPwm[i] != 0) directPwm = true;
@@ -965,11 +1044,8 @@ void loop() {
     gin.neutral  = p.vx == 0 && p.vy == 0 && p.omega == 0 && !directPwm;
     gin.testMode = testMode;
     DriveGateOut gout = driveGateStep(&gate, gin, now, FAULT_CLEAR_MS);
-    if (gout.faultCleared) {
-      faultMask = 0;
-      for (int i = 0; i < 4; i++) faultState[i].ms = 0.0f;
-      Serial.println("FAULT cleared (sticks neutral)");
-    }
+    if (gout.faultCleared)
+      for (int i = 0; i < 4; i++) rearmWheel(i, now, "sticks neutral");
     if (gout.linkLatched && !wasStopped)
       Serial.println("LINK LOST - stopped; centre the sticks to resume once the link is back");
     if (gout.linkReleased && !testMode)
@@ -1036,7 +1112,10 @@ void loop() {
       // as the lagging wheel recovers. Judged on the BASE twist (curCmd).
       int32_t driveCmd[4];
       if (enableGovernor) {
-        bool valid[4] = { !openLoop[0], !openLoop[1], !openLoop[2], !openLoop[3] };
+        // A wheel with no usable feedback (open-loop, or switched off by a drive
+        // fault) must not drag the group: skip it.
+        bool valid[4];
+        for (int i = 0; i < 4; i++) valid[i] = !openLoop[i] && !(faultMask & (1u << i));
         // Judge wheels by magnitude + output saturation (sign-independent), so a
         // held wheel is caught identically in forward and reverse. Uses last tick's
         // measured speeds and PWM.
@@ -1069,10 +1148,18 @@ void loop() {
       // yawing"). The correction is an additive wheel-space twist added AFTER the
       // governor scale, so its yaw authority survives while the governor throttles
       // base magnitude. See body_loop.h.
-      if (enableBodyLoop) {
+      // With ONE wheel switched off the loop keeps running on the three live
+      // wheels (that wheel's speed is reconstructed from them, kinematics.h
+      // fillDeadWheel), so heading hold keeps compensating for the dead corner.
+      // With two or more off the twist is underdetermined: the loop stands down.
+      const int nDead = deadWheelCount();
+      if (enableBodyLoop && nDead <= 1) {
         const float refTps = cmdRefTps();
+        float meas[4] = { lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3] };
+        if (nDead == 1)
+          for (int i = 0; i < 4; i++) if (faultMask & (1u << i)) fillDeadWheel(meas, i);
         float vx_m, vy_m, w_m, s_m;
-        forwardKinematics(lastMeasTps, refTps, &vx_m, &vy_m, &w_m, &s_m);
+        forwardKinematics(meas, refTps, &vx_m, &vy_m, &w_m, &s_m);
         // Single-pole IIR on the body estimate (heavier on noisy omega/vy).
         bodyVxF += BODY_IIR_ALPHA_TRANS * (vx_m - bodyVxF);
         bodyVyF += BODY_IIR_ALPHA_W     * (vy_m - bodyVyF);
@@ -1121,25 +1208,38 @@ void loop() {
 
       for (int i = 0; i < 4; i++) lastDriveCmd[i] = driveCmd[i];
       uint8_t tripped = pidStep(driveCmd, dt, dtMeas);
+      wasStopped = false;
       if (tripped) {
+        // Switch off ONLY the tripped wheel(s), right now (pidStep already wrote
+        // this tick's PWM); the rest keep driving. Reported to the controller.
         driveGateTrip(&gate, now);
-        faultMask = tripped;
-        motorStopAll();
-        pidReset();
-        wasStopped = true;
+        faultMask |= tripped;
         char names[40] = "";
+        uint32_t retryMs = 0;
         for (int i = 0; i < 4; i++) {
           if (!(tripped & (1u << i))) continue;
+          motorWrite(i, 0);
+          lastOutPwm[i]   = 0.0f;
+          pid[i].integral = 0.0f;
+          wheelRecoveryTrip(&recov[i], now, RECOV_CFG);
+          retryMs = recov[i].delayMs;
           char one[16];
           snprintf(one, sizeof(one), "%s%s (slot %d)", names[0] ? ", " : "", RIDER_NAME[i], i);
           strncat(names, one, sizeof(names) - strlen(names) - 1);
         }
         Serial.printf("FAULT %s: driven at >=%.0f%% PWM with no encoder motion for %.0f ms "
-                      "(dead encoder or jammed wheel) - all motors stopped. "
-                      "Release the sticks for %lu ms to clear.\n",
-                      names, FAULT_PWM_FRAC * 100.0f, FAULT_MS, (unsigned long)FAULT_CLEAR_MS);
-      } else {
-        wasStopped = false;
+                      "(dead encoder or jammed wheel) - wheel switched off, driving on the "
+                      "others. Retry in %lu ms (sooner if it rolls freely, or release the sticks).\n",
+                      names, FAULT_PWM_FRAC * 100.0f, FAULT_MS, (unsigned long)retryMs);
+      }
+
+      // Bring switched-off wheels back while driving: at once if the unpowered
+      // wheel is seen rolling freely, else when its retry delay runs out.
+      for (int i = 0; i < 4; i++) {
+        if (!(faultMask & (1u << i))) continue;
+        int why = wheelRecoveryStep(&recov[i], now, lastMeasTps[i], dt * 1000.0f, RECOV_CFG);
+        if (why == 1) rearmWheel(i, now, "rolling freely");
+        else if (why == 2) rearmWheel(i, now, "retry");
       }
     }
   }

@@ -1,5 +1,7 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
+#include "control_math.h"   // crc8()
 
 // ESP-NOW packet: controller -> robot
 // Send rate ~50Hz. Robot watchdog stops motors if no packet for 500ms.
@@ -42,6 +44,48 @@ static inline uint8_t ctrlFlagsFromPreset(uint8_t disableBits, bool estop) {
 // sizeof(CtrlPacket) — so a silent struct-size drift (added field, alignment
 // change) kills the whole link with zero diagnostics. Fail the build instead.
 static_assert(sizeof(CtrlPacket) == 13, "CtrlPacket wire format must stay 13 bytes");
+
+// ESP-NOW status packet: robot -> controller (back-channel, ~5 Hz), sent to
+// whichever transmitter the robot's receive gate is locked onto. Lets the
+// controller show what the robot is doing instead of a bare ONLINE: which wheel a
+// drive fault switched off, and when the robot is waiting for neutral sticks.
+// Different length from CtrlPacket, so neither side can mistake one for the other.
+struct __attribute__((packed)) StatusPacket {
+  uint8_t magic;      // STATUS_MAGIC
+  uint8_t seq;        // wraps; informational only
+  uint8_t faultMask;  // bit i = motor slot i switched off by a drive fault
+  uint8_t flags;      // STATUS_FLAG_* below
+  uint8_t crc;        // crc8 over all preceding bytes. MUST be last.
+};
+static_assert(sizeof(StatusPacket) == 5, "StatusPacket wire format must stay 5 bytes");
+
+#define STATUS_MAGIC             0x5A
+#define STATUS_FLAG_LINK_LATCH   0x01   // waiting for a neutral frame after a link loss
+#define STATUS_FLAG_TEST_MODE    0x02   // serial bench mode owns the drive
+#define STATUS_FLAG_ENC_DOWN     0x04   // encoder init failed: drive disabled
+
+static inline StatusPacket statusPacketMake(uint8_t seq, uint8_t faultMask, uint8_t flags) {
+  StatusPacket p = { STATUS_MAGIC, seq, (uint8_t)(faultMask & 0x0F), flags, 0 };
+  p.crc = crc8((const uint8_t*)&p, offsetof(StatusPacket, crc));
+  return p;
+}
+
+// True (and *out filled) only for a well-formed status frame.
+static inline bool statusPacketParse(const uint8_t* data, int len, StatusPacket* out) {
+  if (len != (int)sizeof(StatusPacket)) return false;
+  StatusPacket p;
+  for (size_t i = 0; i < sizeof(p); i++) ((uint8_t*)&p)[i] = data[i];
+  if (p.magic != STATUS_MAGIC) return false;
+  if (p.crc != crc8((const uint8_t*)&p, offsetof(StatusPacket, crc))) return false;
+  *out = p;
+  return true;
+}
+
+// The rider's name for each motor slot. Slots are named in the firmware frame
+// (FL FR RL RR), but the rider faces the firmware's rear (config_controller.h
+// INVERT_VX/VY); bench-confirmed 2026-10-05: slot 0 is the rider's rear-right.
+// Everything shown to a human uses these.
+static const char* const SLOT_RIDER_NAME[4] = { "RR", "RL", "FR", "FL" };
 
 // Robot MAC + ESP-NOW keys live in secrets.h (gitignored). A fresh clone with no
 // secrets.h still builds via the fallback below. Copy secrets.h.example ->

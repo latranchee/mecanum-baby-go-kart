@@ -82,6 +82,25 @@ static void onSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
   if (lastAckOK) lastAckMs = millis();
 }
 
+// Robot status back-channel (protocol.h StatusPacket, ~5 Hz): which wheel a drive
+// fault switched off, link latch, test mode, encoder failure. Written in the WiFi
+// task, read by loop(); single-byte/word fields, and a stale mix for one 100 ms
+// display refresh is harmless.
+static volatile uint8_t  robotFaultMask = 0;
+static volatile uint8_t  robotFlags     = 0;
+static volatile uint32_t lastStatusMs   = 0;
+static volatile bool     statusSeen     = false;
+
+static void onStatus(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (memcmp(info->src_addr, ROBOT_MAC, 6) != 0) return;
+  StatusPacket sp;
+  if (!statusPacketParse(data, len, &sp)) return;
+  robotFaultMask = sp.faultMask;
+  robotFlags     = sp.flags;
+  lastStatusMs   = millis();
+  statusSeen     = true;
+}
+
 static void setupEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -99,6 +118,7 @@ static void setupEspNow() {
     return;
   }
   esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onStatus);
 
 #if ESPNOW_ENCRYPT
   esp_now_set_pmk((const uint8_t*)ESPNOW_PMK);  // must precede add_peer (#3)
@@ -166,19 +186,45 @@ static uint8_t  speedPct      = 50;       // 10..100, step 10
 static uint8_t  lastSpeedPct  = 0;
 static uint32_t lastDispMs    = 0;
 
-// What the status bar shows. Everything that stops the cart has its own word, so
-// the screen never says ONLINE while the controller is not driving.
-enum StatusView : uint8_t { SV_NONE, SV_NO_RADIO, SV_JOY_ERR, SV_ESTOP, SV_CENTER, SV_ONLINE, SV_OFFLINE };
-static StatusView lastView = SV_NONE;
+// What the status bar shows. Everything that stops the cart, and everything the
+// robot reports back, has its own word, so the screen never says ONLINE while the
+// cart is not doing what the sticks say.
+enum StatusView : uint8_t {
+  SV_NONE, SV_NO_RADIO, SV_JOY_ERR, SV_ESTOP, SV_CENTER, SV_OFFLINE,
+  SV_ENC_ERR, SV_TEST, SV_FAULT, SV_ONLINE
+};
+static StatusView lastView      = SV_NONE;
+static uint8_t    lastFaultDrawn = 0;
 
 static StatusView currentView(uint32_t now) {
+  // Robot status older than 1 s (5 periods) is unknown, not "all fine".
+  const bool fresh = statusSeen && linkAgeMs(now, lastStatusMs) < 1000;
+  const uint8_t rf = fresh ? robotFlags : 0;
   if (!peerAdded)                return SV_NO_RADIO;   // radio dead: nothing is sent
   if (joyFails >= JOY_FAIL_TRIP) return SV_JOY_ERR;    // sticks unreadable: e-stop sent
   if (estopHeld)                 return SV_ESTOP;
-  if (!calibrated || !armed)     return SV_CENTER;     // release / centre the sticks
+  // Release / centre the sticks: the controller is disarmed, OR the robot is
+  // waiting for a neutral frame after a link loss (its link latch).
+  if (!calibrated || !armed || (rf & STATUS_FLAG_LINK_LATCH)) return SV_CENTER;
   // Signed age: onSent stamps lastAckMs on core 0 and can land after `now` was
   // read here; an unsigned difference wrapped and flashed OFFLINE for a refresh.
-  return linkAgeMs(now, lastAckMs) < 500 ? SV_ONLINE : SV_OFFLINE;
+  if (linkAgeMs(now, lastAckMs) >= 500) return SV_OFFLINE;
+  if (rf & STATUS_FLAG_ENC_DOWN)  return SV_ENC_ERR;   // robot drive disabled
+  if (fresh && robotFaultMask)    return SV_FAULT;     // a wheel is switched off
+  if (rf & STATUS_FLAG_TEST_MODE) return SV_TEST;      // serial bench owns the drive
+  return SV_ONLINE;
+}
+
+// What the status bar says, for the serial log (so the screen can be checked
+// without looking at it).
+static const char* viewName(StatusView v) {
+  switch (v) {
+    case SV_NO_RADIO: return "NO_RADIO";  case SV_JOY_ERR: return "JOY_ERR";
+    case SV_ESTOP:    return "E-STOP";    case SV_CENTER:  return "CENTER";
+    case SV_OFFLINE:  return "OFFLINE";   case SV_ENC_ERR: return "ENC_ERR";
+    case SV_TEST:     return "TEST_MODE"; case SV_FAULT:   return "FAULT";
+    case SV_ONLINE:   return "ONLINE";    default:         return "-";
+  }
 }
 
 static void drawHeader() {
@@ -189,22 +235,30 @@ static void drawHeader() {
   M5.Display.drawString("MECANUM", 64, 4);
 }
 
-static void drawStatus(StatusView v) {
+static void drawStatus(StatusView v, uint8_t faultMask, bool blinkOn) {
+  char faultText[24];
   const char* text = "";
   uint16_t bg = TFT_RED, fg = TFT_WHITE;
+  // A wheel fault blinks (red <-> yellow every 400 ms) so it can't pass for a
+  // steady status while the operator's eyes are on the cart.
+  if (v == SV_FAULT && !blinkOn) { bg = TFT_YELLOW; fg = TFT_BLACK; }
   switch (v) {
-    case SV_NO_RADIO: text = "NO RADIO"; break;
-    case SV_JOY_ERR:  text = "JOY ERR";  break;
-    case SV_ESTOP:    text = "E-STOP";   break;
-    case SV_CENTER:   text = "CENTER";   bg = TFT_ORANGE; fg = TFT_BLACK; break;
-    case SV_ONLINE:   text = "ONLINE";   bg = TFT_DARKGREEN; break;
-    case SV_OFFLINE:  text = "OFFLINE";  break;
+    case SV_NO_RADIO: text = "NO RADIO";  break;
+    case SV_JOY_ERR:  text = "JOY ERR";   break;
+    case SV_ESTOP:    text = "E-STOP";    break;
+    case SV_CENTER:   text = "CENTER";    bg = TFT_ORANGE; fg = TFT_BLACK; break;
+    case SV_OFFLINE:  text = "OFFLINE";   break;
+    case SV_ENC_ERR:  text = "ENC ERR";   break;
+    case SV_TEST:     text = "TEST MODE"; bg = TFT_NAVY; break;
+    case SV_FAULT:    faultLabel(faultMask, faultText, sizeof(faultText)); text = faultText; break;
+    case SV_ONLINE:   text = "ONLINE";    bg = TFT_DARKGREEN; break;
     default: break;
   }
   M5.Display.fillRect(0, 16, 128, 16, bg);
   M5.Display.setTextColor(fg, bg);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.setTextSize(2);
+  // Size 2 fits 10 characters across 128 px; "FAULT RR FL" and longer drop to size 1.
+  M5.Display.setTextSize(strlen(text) <= 10 ? 2 : 1);
   M5.Display.drawString(text, 64, 24);
 }
 
@@ -262,9 +316,14 @@ static void refreshDisplay(uint32_t now, const int16_t* sticks /* lV,lH,rV,rH or
   if (now - lastDispMs < 100) return;
   lastDispMs = now;
   StatusView v = currentView(now);
-  if (v != lastView) {
-    drawStatus(v);
-    lastView = v;
+  const uint8_t fm = robotFaultMask;
+  const bool blinkOn = ((now / 400) & 1) == 0;
+  static bool lastBlink = false;
+  if (v != lastView || (v == SV_FAULT && (fm != lastFaultDrawn || blinkOn != lastBlink))) {
+    drawStatus(v, fm, blinkOn);
+    lastView       = v;
+    lastFaultDrawn = fm;
+    lastBlink      = blinkOn;
   }
   if (speedPct != lastSpeedPct) {
     drawSpeedCompact(speedPct);
@@ -451,9 +510,11 @@ void loop() {
   // Serial log @ 5Hz
   if (now - lastLogMs >= 200) {
     lastLogMs = now;
-    Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X armed=%d conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
+    Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X armed=%d conn=%d screen=%s robot=[flt=%X fl=%X age=%lu] L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
                   (unsigned long)seq, speedPct, MODE_PRESETS[modeIdx].name, btnMask, armed ? 1 : 0,
-                  linkAgeMs(now, lastAckMs) < 500 ? 1 : 0,
+                  linkAgeMs(now, lastAckMs) < 500 ? 1 : 0, viewName(lastView),
+                  (unsigned)robotFaultMask, (unsigned)robotFlags,
+                  (unsigned long)(statusSeen ? linkAgeMs(now, lastStatusMs) : 9999),
                   raw[AX_LH], raw[AX_LV], raw[AX_RH], raw[AX_RV], vx, vy, omega);
   }
 }
