@@ -47,6 +47,7 @@ struct BodyLoopCfg {
   float corrMax;         // hard per-axis correction clamp, cmd units
   float yawFwdFrac;      // (BUG-004/005) yaw corr cap as a fraction of throttled fwd
   float iDecay;          // (BUG-007) frozen-integral bleed rate, 1/s
+  float straightW;       // |omega_cmd| below which yaw hold survives a freeze
 };
 
 static inline float bl_clamp(float v, float lim) {
@@ -75,7 +76,8 @@ static inline float bl_rate(float cur, float tgt, float maxStep) {
 //                    command expresses (mixInverse of curCmd), not the raw packet.
 //   vx_m,vy_m,w_m  : measured (IIR-filtered) body twist from forwardKinematics().
 //   freezeIntegral : true => governor owns magnitude (saturation/throttle/slip):
-//                    decay the integral AND drop the proportional term (BUG-006/007).
+//                    decay the integral AND drop the proportional term (BUG-006/007),
+//                    except yaw on a straight-line move (cfg->straightW).
 //   govScale       : current governor scale [floor..1]; fades all corrections.
 //   fwdAuth        : current THROTTLED forward authority magnitude (cmd units,
 //                    = |commanded translation| * govScale). Bounds the yaw
@@ -130,6 +132,17 @@ static inline void bodyCorrection(
   float eVy = vy_c - vy_m;
   float eW  = wRef - w_m;
 
+  // STRAIGHT-LINE HEADING HOLD SURVIVES THE FREEZE (2026-10-05 floor report: a
+  // strafe swung the nose round the rear wheels). Under load the rider's rear pair
+  // (weaker pack + the rider's weight) sits at the saturation gate through a whole
+  // strafe, so the freeze below switched heading hold off for exactly the move
+  // where a front/rear speed gap turns into yaw. The freeze exists to keep this
+  // loop from pumping yaw INTO a loaded curve (BUG-001/006). With no turn
+  // commanded the yaw reference is zero, so the yaw term can only straighten the
+  // cart: the governor still owns magnitude, and translation correction still
+  // freezes. `straight` fades this exemption out over the first straightW of turn.
+  float straight = 1.0f - bl_smoothstep(0.0f, cfg->straightW, aw);
+
   // Integral: when the governor owns magnitude, DECAY toward zero (BUG-007) so a
   // value wound up in an unfrozen window cannot HOLD across the freeze threshold
   // and dump as a heading kick. Otherwise integrate, weighting each axis like its
@@ -137,7 +150,8 @@ static inline void bodyCorrection(
   if (freezeIntegral) {
     float dk = cfg->iDecay * dt;
     if (dk > 1.0f) dk = 1.0f;
-    st->iw -= st->iw * dk;
+    st->iw += eW * cfg->kiW * dt * wYaw * straight;   // straight: keep holding heading
+    st->iw -= st->iw * dk * (1.0f - straight);        // turning: bleed off as before
     st->ix -= st->ix * dk;
     st->iy -= st->iy * dk;
   } else {
@@ -154,8 +168,9 @@ static inline void bodyCorrection(
   // situation, so the body loop yields HEADING too — drop the proportional term
   // (which would otherwise keep firing on the standing error the governor is
   // already handling). Only the decaying integral remains. Off-freeze, full P.
-  float pGate = freezeIntegral ? 0.0f : 1.0f;
-  float corrW  = wYaw   * (cfg->kpW     * eW  * pGate + st->iw);
+  float pGate  = freezeIntegral ? 0.0f     : 1.0f;
+  float pGateW = freezeIntegral ? straight : 1.0f;   // straight-line exemption above
+  float corrW  = wYaw   * (cfg->kpW     * eW  * pGateW + st->iw);
   float corrVx = wTrans * (cfg->kpTrans * eVx * pGate + st->ix);
   float corrVy = wTrans * (cfg->kpTrans * eVy * pGate + st->iy);
 

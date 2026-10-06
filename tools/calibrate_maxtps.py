@@ -75,7 +75,7 @@ def measure(ser, slot, pwm, spin_s, settle_s):
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Measure per-wheel full-PWM tick rate.")
-    p.add_argument("--port", default="COM8")
+    p.add_argument("--port", default="COM5")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--pwm", type=int, default=1023, help="drive PWM (default full 1023)")
     p.add_argument("--spin", type=float, default=2.0, help="seconds per direction")

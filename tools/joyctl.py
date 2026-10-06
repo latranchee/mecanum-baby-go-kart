@@ -270,7 +270,7 @@ def print_summary(results: list[StimulusResult]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Inject joystick packets to mecanum robot over USB serial.")
-    p.add_argument("--port", default="COM8", help="serial port (default COM8)")
+    p.add_argument("--port", default="COM5", help="serial port (default COM5)")
     p.add_argument("--baud", type=int, default=115200, help="baud rate (default 115200)")
     p.add_argument("--sweep", action="store_true", help="run base stimulus sweep instead of REPL")
     p.add_argument("--capture-seconds", type=float, default=2.0, help="per-stimulus capture window (sweep)")

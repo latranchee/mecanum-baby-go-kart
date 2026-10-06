@@ -16,7 +16,7 @@ from tlm import KEEPALIVE_S  # type: ignore
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', default='COM8')
+    p.add_argument('--port', default='COM5')
     p.add_argument('--baud', type=int, default=115200)
     p.add_argument('--vx', type=int, default=0)
     p.add_argument('--vy', type=int, default=0)

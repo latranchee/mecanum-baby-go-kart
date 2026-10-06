@@ -51,7 +51,7 @@ def steady(samples, window_s=0.7):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', default='COM8')
+    p.add_argument('--port', default='COM5')
     p.add_argument('--baud', type=int, default=115200)
     p.add_argument('--pwm', type=int, default=500, help='PWM magnitude (0..1023)')
     p.add_argument('--run-secs', type=float, default=1.5)

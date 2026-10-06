@@ -13,7 +13,7 @@ from tlm import parse_tlm  # type: ignore
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', default='COM8')
+    p.add_argument('--port', default='COM5')
     p.add_argument('--baud', type=int, default=115200)
     p.add_argument('--slot', type=int, default=1)
     p.add_argument('--pwm', type=int, default=500)
