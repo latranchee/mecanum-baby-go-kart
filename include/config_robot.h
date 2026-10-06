@@ -11,14 +11,16 @@ static const int PWM_MAX  = (1 << PWM_RES) - 1;   // 1023
 static const int DEADBAND = 0;  // disabled: PID feed-forward handles low-speed PWM
 
 // Encoder input glitch filter (PCNT hardware): a pulse shorter than this never
-// reaches the counter. At full speed each encoder channel's pulse is ~230 us wide
-// (MAX_TPS ~8700 edges/s = 4 edges per 460 us cycle); motor-switching spikes are a
-// few us. The ESP32 filter tops out at ~12.7 us (1023 APB cycles), so setting this
+// reaches the counter. Each channel pulse spans 2 of the 4 edges per cycle: at
+// the fastest calibrated wheel (12414 edges/s, 2026-10-05) that is ~161 us, still
+// 16x the filter; motor-switching spikes are a few us. The ESP32 filter tops out at ~12.7 us (1023 APB cycles), so setting this
 // higher makes encoder init fail and the robot refuse to drive.
 static const uint32_t ENC_GLITCH_NS = 10000;
 
 // Velocity control
-// Per-wheel full-PWM tick rate (ticks/sec) — slot order [FL,FR,RL,RR].
+// Per-wheel full-PWM tick rate (ticks/sec) — slot order [FL,FR,RL,RR] in the
+// FIRMWARE frame, which is the rider's [RR,RL,FR,FL] (config_controller.h
+// INVERT_VX/VY: the rider faces the firmware's rear).
 // 4x quadrature decode (BUG-008 fixed): every A/B edge counts, so the tick rate
 // is ~4x the old single-edge value. These MUST be re-measured on hardware after
 // the decode change AND whenever the supply changes — with two battery halves of
@@ -26,12 +28,19 @@ static const uint32_t ENC_GLITCH_NS = 10000;
 // is what lets feed-forward + the governor normalize correctly (the whole point
 // of this change). Calibrate with tools/calibrate_maxtps.py (wheels off ground).
 // Feed-forward gain is derived per wheel as PWM_MAX / MAX_TPS[i] at use site.
-// Measured 2026-06-07 (2-battery / dual-20A-buck rig, 4x decode, no-load, full PWM,
-// min of fwd/rev per wheel): wheels within ~3% (skew <2.5%) — rails well matched,
-// no buck mismatch. FL weakest = uniform ref. Supersedes the 2026-06-02 single-buck
-// values (8275/8483/8342/8230), which under-stated by ~3% so cmd 1000 targeted below
-// the wheels' real top speed. Recalibrate again whenever the supply changes.
-static const float MAX_TPS[4] = { 8502.0f, 8688.0f, 8778.0f, 8669.0f };
+// Measured 2026-10-05 (PCNT 4x decode, no-load, full PWM, min of fwd/rev per wheel).
+// Cross-checked the same day with the old GPIO-interrupt decoder (commit 88e4ded):
+// all four within 1%, so the PCNT decode is validated. Slots 2/3 (firmware rear =
+// the RIDER's FRONT pair) now turn ~45% faster than slots 0/1 (the rider's REAR
+// pair) at full PWM; slots 0/1 match 2026-06-07, slots 2/3 were 8778/8669. Each
+// pair runs on its own battery set and the gap tracks those packs' voltage/charge,
+// so these values move whenever a set is charged or swapped: recalibrate then. Top
+// speed stays capped by the weakest wheel (slot 0 = rider's rear-right) through
+// the uniform reference below; the stronger pair simply uses less of its PWM range.
+// History: 2026-06-07 = 8502/8688/8778/8669 (rails matched within 3%);
+// 2026-06-02 single-buck = 8275/8483/8342/8230. Recalibrate whenever the supply
+// changes.
+static const float MAX_TPS[4] = { 8350.0f, 8548.0f, 12414.0f, 12318.0f };
 // Smallest per-wheel max — used where one scalar reference is still needed.
 static inline float maxTpsMin() {
   float m = MAX_TPS[0];
@@ -187,20 +196,26 @@ static const float STALL_TPS_FRAC = 0.08f;   // |measured| below this fraction o
 static const float STALL_MS       = 300.0f;  // sustained for this long
 
 // Drive fault (safety.h driveFaultStep): a wheel at or above FAULT_PWM_FRAC of
-// PWM_MAX that measures under FAULT_TPS_FRAC of its MAX_TPS for FAULT_MS = dead
-// encoder or jammed wheel. Every motor stops and the fault LATCHES: it clears after
-// FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live link, or `r`/`x` on the
-// bench. A free wheel at 30% PWM turns ~2500 tps and a loaded one still clears
-// 170 tps (1.7 ticks per 10 ms) within a few ticks of breakaway, so only a wheel
-// that is truly not turning trips. A persistent dead encoder re-trips on each
-// attempt after ~0.4 s of travel, which is the cue to look at the cart.
+// PWM_MAX that measures under FAULT_TPS ticks/s for FAULT_MS = dead encoder or
+// jammed wheel. Every motor stops and the fault LATCHES (safety.h DriveGate): it
+// clears after FAULT_CLEAR_MS of neutral sticks (or e-stop) on a live link, or
+// `r`/`x` on the bench.
+// FAULT_TPS is ABSOLUTE, the same for every wheel: 150 ticks/s = 1.5 counts per
+// 10 ms tick, so a jammed wheel jittering +-1 count still counts as stopped, while
+// any wheel actually rolling clears it. It used to be 2% of each wheel's own
+// MAX_TPS; after the 2026-10-05 recalibration that put the fast pair at 248 tps and
+// a slow, heavy start could trip it with the cart already rolling.
+// A persistent dead encoder re-trips on each attempt after ~0.4 s of travel,
+// which is the cue to look at the cart.
 static const float    FAULT_PWM_FRAC = 0.30f;
-static const float    FAULT_TPS_FRAC = 0.02f;
+static const float    FAULT_TPS      = 150.0f;
 static const float    FAULT_MS       = 300.0f;
 static const uint32_t FAULT_CLEAR_MS = 1000;
 
 // Link watchdog: stop motors if no fresh packet for this long. Also the silence
 // after which the receive gate reopens for a rebooted/other controller (safety.h).
+// A link loss also LATCHES the drive (safety.h DriveGate): it resumes only after a
+// neutral (or e-stop) frame, so a flaky link can't relaunch the cart at a held stick.
 static const uint32_t WATCHDOG_MS = 500;
 
 // Bench test mode (serial t/m commands) has no radio packets to feed the watchdog,

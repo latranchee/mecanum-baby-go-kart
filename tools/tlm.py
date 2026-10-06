@@ -15,6 +15,12 @@ _FIELD_RE = re.compile(r"(\w+)=(\[[^\]]*\]|\S+)")
 
 _REPO = Path(__file__).resolve().parent.parent
 
+# Motor slots are named in the firmware frame (FL FR RL RR), but the rider faces
+# the firmware's rear (controller INVERT_VX/VY; bench-confirmed 2026-10-05: slot 0
+# is the rider's rear-right). Tools print the rider's names for humans.
+FIRMWARE_NAME = ["FL", "FR", "RL", "RR"]
+RIDER_NAME = ["RR", "RL", "FR", "FL"]
+
 # Bench tools send this while a test drives: the robot stops a driving test after
 # TEST_LINK_MS (1 s) with no serial line, so a crashed script or pulled cable can't
 # leave it running. The robot accepts `k` silently.

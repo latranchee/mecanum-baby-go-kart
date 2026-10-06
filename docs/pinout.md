@@ -55,17 +55,23 @@ Source of truth: the `motors[]` table at the top of `src/robot/main.cpp`. Slot =
 array index = wheel corner. Encoders are decoded in hardware by the PCNT pulse
 counters (4x quadrature), so any input-capable GPIO works for A and B.
 
-| Slot | Corner | PWM | INA | INB | Enc A | Enc B | Harness labels (layout table below) |
-|---|---|---|---|---|---|---|---|
-| 0 | FL | 18 | 5 | 19 | 13 | 17 | P3, A3, B3 / M4 enc |
-| 1 | FR | 21 | 23 | 22 | 16 | 4 | P4, B4 = INA, A4 = INB / M3 enc |
-| 2 | RL | 25 | 27 | 33 | 39 | 36 | P1, B1 = INA, A1 = INB / M1 enc |
-| 3 | RR | 26 | 32 | 14 | 35 | 34 | P2, A2, B2 / M2 enc |
+| Slot | Firmware corner | Rider's corner | PWM | INA | INB | Enc A | Enc B | Harness labels (layout table below) |
+|---|---|---|---|---|---|---|---|---|
+| 0 | FL | **RR** | 18 | 5 | 19 | 13 | 17 | P3, A3, B3 / M4 enc |
+| 1 | FR | **RL** | 21 | 23 | 22 | 16 | 4 | P4, B4 = INA, A4 = INB / M3 enc |
+| 2 | RL | **FR** | 25 | 27 | 33 | 39 | 36 | P1, B1 = INA, A1 = INB / M1 enc |
+| 3 | RR | **FL** | 26 | 32 | 14 | 35 | 34 | P2, A2, B2 / M2 enc |
+
+The rider faces the firmware's rear (the controller inverts vx and vy; see the
+README "Wheel layout"), so the firmware's FL is the rider's rear-right:
+bench-confirmed 2026-10-05 by spinning slot 0 alone.
 
 The harness numbers (1-4, M1-M4) are the physical driver channels and wire
-labels; they predate the 2026-05-31 body swap. Where the code's INA sits on a
-"B" wire, the swap inverts that motor's direction in software (see the comment
-on `motors[]`).
+labels; they predate the 2026-05-31 body swap. INA/INB in this table are what
+the code drives, and they do not always match the A/B wire label (slots 1 and 2
+use the "B" wire as INA). The direction each slot gets for +PWM was set by
+solo-PWM observation on the bench, not derived from the labels: `motors[]` in
+`src/robot/main.cpp` is authoritative.
 
 ### Boot and reset state
 

@@ -3,6 +3,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_system.h>   // esp_reset_reason()
+#include <esp_mac.h>      // esp_read_mac()
+#include <esp_log.h>      // esp_log_level_set/get (mute PCNT pull-up noise)
 #include <esp_task_wdt.h> // loop watchdog
 #include <driver/pulse_cnt.h>  // PCNT quadrature decode
 #include "protocol.h"
@@ -11,7 +13,7 @@
 #include "governor.h"       // speedGovernorScale() — cross-wheel sync
 #include "body_loop.h"      // bodyCorrection() — body-space outer loop
 #include "control_math.h"   // crc8()
-#include "safety.h"         // linkAgeMs(), linkGateCheck(), driveFaultStep()
+#include "safety.h"         // linkAgeMs(), linkGateCheck(), driveFaultStep(), driveGateStep()
 
 // Direction-pin masks read by the task-watchdog ISR hook (src/robot/wdt_hook.cpp).
 extern volatile uint32_t g_motorDirMaskLo;
@@ -72,6 +74,12 @@ static const bool openLoop[4] = { false, false, false, false };
 static const int ENC_PCNT_LIMIT = 32000;
 static pcnt_unit_handle_t encUnit[4] = { nullptr, nullptr, nullptr, nullptr };
 static bool encReady = false;   // true once all four units are counting
+
+// Bench fault test (`d <slot>` in test mode): that wheel's encoder reads frozen,
+// exactly like a disconnected encoder, so the drive-fault stop can be exercised on
+// a healthy cart. Cleared by `d -1` and on leaving test mode. -1 = off.
+static int8_t simDeadEnc   = -1;
+static long   simDeadCount = 0;
 
 static bool isInputOnly(uint8_t pin) {
   return pin == 34 || pin == 35 || pin == 36 || pin == 39;
@@ -206,7 +214,7 @@ static BodyLoopState bodyState = { 0, 0, 0, 0, 0, 0 };
 static float bodyVxF = 0, bodyVyF = 0, bodyWF = 0, bodySF = 0;  // filtered vx,vy,omega,slip
 static float lastBodyCorr[3] = { 0, 0, 0 };                     // last (dvx,dvy,dw) for telemetry
 
-// Last PID step values for telemetry (M1 only, to keep log short)
+// Last PID step values per wheel (telemetry, governor and body-loop inputs)
 static float lastTargetTps[4] = { 0, 0, 0, 0 };
 static float lastMeasTps[4]   = { 0, 0, 0, 0 };
 static float lastOutPwm[4]    = { 0, 0, 0, 0 };
@@ -217,10 +225,13 @@ static bool  wheelStalled[4] = { false, false, false, false };
 
 // Drive fault (safety.h): driven hard with no encoder motion -> stop + latch.
 static DriveFault faultState[4] = {};
-static bool       driveFault    = false;
-static uint8_t    faultMask     = 0;     // bit i = wheel i tripped
-static uint32_t   faultIdleSinceMs = 0;  // start of the neutral window that clears it
-static const char* const WHEEL_NAME[4] = { "FL", "FR", "RL", "RR" };
+static DriveGate  gate          = { false, true, 0 };  // link latched until the first neutral frame
+static uint8_t    faultMask     = 0;     // bit i = wheel i tripped (telemetry)
+// Slot names as the RIDER sees them. Slots are named in the firmware frame
+// (motors[] comments: FL FR RL RR), but the rider faces the firmware's rear
+// (config_controller.h INVERT_VX/VY; bench-confirmed 2026-10-05: slot 0 is the
+// rider's rear-right). Everything printed for a human uses these.
+static const char* const RIDER_NAME[4] = { "RR", "RL", "FR", "FL" };
 
 // Wheel commands actually handed to pidStep last tick (after slew, governor and
 // body correction). Telemetry `cmd=` reports these, not the raw packet mix.
@@ -233,6 +244,7 @@ static bool wasStopped = true;
 // Accumulated (32-bit) encoder count. Reads 0 for a unit that failed to init;
 // encReady keeps the drive stopped in that case.
 static long readCount(uint8_t i) {
+  if ((int8_t)i == simDeadEnc) return simDeadCount;   // bench: simulated dead encoder
   int c = 0;
   if (encUnit[i]) pcnt_unit_get_count(encUnit[i], &c);
   return c;
@@ -276,14 +288,17 @@ static inline float limitPwm(float desired, float prevOut, float dt) {
 // Returns this wheel's bit if it tripped this tick.
 static inline uint8_t faultCheck(int i, float out, float measuredTps, float dt) {
   bool trip = driveFaultStep(&faultState[i], out, measuredTps,
-                             FAULT_PWM_FRAC * (float)PWM_MAX, FAULT_TPS_FRAC * MAX_TPS[i],
+                             FAULT_PWM_FRAC * (float)PWM_MAX, FAULT_TPS,
                              FAULT_MS, dt * 1000.0f);
   return trip ? (uint8_t)(1u << i) : 0;
 }
 
-// cmd[i] in [-1000..+1000]; dt in seconds. Returns a mask of wheels whose drive
+// cmd[i] in [-1000..+1000]. dt = the CONTROL step in seconds (clamped by the
+// caller; drives slew, integral and fault timing). dtMeas = the TRUE time the
+// encoder delta spans: measuring speed with the clamped dt read a 100 ms stall as
+// double speed and dipped PWM for a tick. Returns a mask of wheels whose drive
 // fault tripped this tick (0 = healthy); the caller stops everything.
-static uint8_t pidStep(const int32_t cmd[4], float dt) {
+static uint8_t pidStep(const int32_t cmd[4], float dt, float dtMeas) {
   uint8_t tripped = 0;
   for (int i = 0; i < 4; i++) {
     // Signed encoder delta (apply sign to fix wiring inversions).
@@ -298,10 +313,10 @@ static uint8_t pidStep(const int32_t cmd[4], float dt) {
     // current swing makes more noise — a self-sustaining limit cycle (worst on
     // vx+, all 4 motors inrushing forward together). The PCNT glitch filter now
     // drops most of that noise at the pin; this clamp stays as the backstop.
-    long maxDelta = (long)(MAX_TPS[i] * 1.5f * dt) + 2;
+    long maxDelta = (long)(MAX_TPS[i] * 1.5f * dtMeas) + 2;
     if (delta >  maxDelta) delta =  maxDelta;
     if (delta < -maxDelta) delta = -maxDelta;
-    float measuredTps = encSign[i] * (float)delta / dt;
+    float measuredTps = encSign[i] * (float)delta / dtMeas;
 
     // Feed-forward is per-wheel (a weak-battery wheel needs more PWM per tick/sec),
     // but the TARGET is a UNIFORM absolute speed referenced to the weakest wheel
@@ -414,15 +429,22 @@ static uint8_t pidStep(const int32_t cmd[4], float dt) {
 // Commands:
 //   t <vx> <vy> <omega>     mix path (each -1000..+1000)
 //   m <slot> <pwm>          direct path (slot 0..3, pwm -1023..+1023)
-//   s                       stop (zero everything)
-//   r                       zero encoder counters + PID, clear a drive fault
-//   x                       exit test mode (ESP-NOW control resumes), clear a fault
+//   s                       stop (zero everything); enters test mode
+//   r                       stop + zero encoder counters + PID + clear a drive fault
+//                           (test mode only: in the field it was a mid-drive jolt)
+//   x                       exit test mode (ESP-NOW control resumes), clear a fault;
+//                           a no-op outside test mode
 //   k                       keepalive (silent): any line feeds the test-link watchdog
+//   d <slot>                bench fault test: freeze that wheel's encoder (d -1 = off)
+//   g|c|b <0|1>             governor / closed loop / body loop on|off (test mode;
+//                           in the field the controller's mode bits own these)
 //   ?                       print one-shot status
 // Failsafes: a test that drives stops after TEST_LINK_MS without a serial line
 // (bench tools send `k` every 250 ms), and a radio e-stop aborts test mode.
 enum TestSrc : uint8_t { TS_MIX, TS_DIRECT };
-static bool      testMode = false;
+// volatile: read by onRecv on core 0 (inside the packet lock) while loop() on
+// core 1 sets it.
+static volatile bool testMode = false;
 static TestSrc   testSrc  = TS_MIX;
 static int16_t   slotPwm[4] = { 0, 0, 0, 0 };
 static char      cmdBuf[64];
@@ -442,17 +464,28 @@ static void setPacketFromTest(int16_t vx, int16_t vy, int16_t omega);
 static void getPacketSnapshot(CtrlPacket& out);
 
 static void clearDriveFault(const char* why) {
-  if (!driveFault) return;
-  driveFault = false;
+  bool was = gate.fault;
+  gate.fault = false;
   faultMask  = 0;
   for (int i = 0; i < 4; i++) faultState[i].ms = 0.0f;
-  Serial.printf("FAULT cleared (%s)\n", why);
+  if (was) Serial.printf("FAULT cleared (%s)\n", why);
+}
+
+// Re-baseline every wheel's last count (PID + telemetry) to what readCount()
+// returns now. Needed whenever readCount() can jump: `d` freezing/releasing an
+// encoder used to produce a one-tick phantom speed spike (clamped to 1.5x MAX).
+static void rebaselineCounts() {
+  for (int i = 0; i < 4; i++) {
+    pid[i].lastCount = readCount(i);
+    prevEnc[i]       = pid[i].lastCount;
+  }
 }
 
 // Leave test mode stopped: ESP-NOW control resumes from a zero packet.
 static void exitTestMode() {
-  testMode = false;
-  testSrc  = TS_MIX;
+  testMode   = false;
+  testSrc    = TS_MIX;
+  simDeadEnc = -1;      // a simulated dead encoder never survives into field control
   for (int i = 0; i < 4; i++) slotPwm[i] = 0;
   setPacketFromTest(0, 0, 0);
   motorStopAll();
@@ -508,22 +541,49 @@ static void handleCommand(char* line) {
       Serial.println("OK s");
       break;
     case 'r':
+      // Test mode only. In the field it zeroed the output slew mid-drive (PWM fell
+      // from ~800 to 25 in one tick, then ramped back) and cleared a fault with the
+      // sticks still pushed. It also stops: clearing a fault must never resume a
+      // latched `t`/`m` command.
+      if (!testMode) { Serial.println("ERR r needs test mode (send s first)"); return; }
+      for (int i = 0; i < 4; i++) slotPwm[i] = 0;
+      setPacketFromTest(0, 0, 0);
+      motorStopAll();
       for (int i = 0; i < 4; i++) if (encUnit[i]) pcnt_unit_clear_count(encUnit[i]);
+      if (simDeadEnc >= 0) simDeadCount = 0;   // the frozen wheel "zeroes" too
       pidReset();
-      // Baseline telemetry from the post-zero counts (not a hard 0) so the first
-      // TLM delta after `r` doesn't show a phantom velocity from counts that
-      // landed between the zeroing and pidReset.
-      for (int i = 0; i < 4; i++) prevEnc[i] = readCount(i);
+      wasStopped = true;
+      // Baseline from the post-zero counts (not a hard 0) so the first delta after
+      // `r` doesn't show a phantom velocity from counts that landed meanwhile.
+      rebaselineCounts();
       clearDriveFault("r");
       Serial.println("OK r");
       break;
     case 'x':
+      if (!testMode) { Serial.println("OK x (not in test mode)"); break; }
       exitTestMode();
       clearDriveFault("x");
       Serial.println("OK x");
       break;
     case 'k':
       break;  // keepalive: pollSerial already stamped lastSerialLineMs
+    case 'd': {
+      // Test mode only: the field path never sees a simulated fault.
+      char* a = strtok(NULL, " \t");
+      int slot = a ? atoi(a) : -1;
+      if (!testMode)                { Serial.println("ERR d needs test mode (send s first)"); return; }
+      if (slot < -1 || slot > 3)    { Serial.println("ERR usage: d <slot 0..3 | -1>"); return; }
+      if (slot >= 0) {
+        int c = 0;
+        if (encUnit[slot]) pcnt_unit_get_count(encUnit[slot], &c);
+        simDeadCount = c;
+      }
+      simDeadEnc = (int8_t)slot;
+      rebaselineCounts();
+      if (slot >= 0) Serial.printf("OK d %d (%s encoder frozen: bench fault test)\n", slot, RIDER_NAME[slot]);
+      else           Serial.println("OK d -1");
+      break;
+    }
     case 'g': {
       char* a = strtok(NULL, " \t");
       if (a) enableGovernor = atoi(a) != 0;
@@ -545,11 +605,11 @@ static void handleCommand(char* line) {
     case '?': {
       CtrlPacket p;
       getPacketSnapshot(p);
-      Serial.printf("STATUS testMode=%d src=%s en=[gov=%d cl=%d body=%d] packet vx=%d vy=%d omega=%d slotPwm=[%d %d %d %d] fault=%u\n",
+      Serial.printf("STATUS testMode=%d src=%s en=[gov=%d cl=%d body=%d] packet vx=%d vy=%d omega=%d slotPwm=[%d %d %d %d] fault=%u simDead=%d\n",
                     testMode ? 1 : 0, testSrc == TS_DIRECT ? "DIRECT" : "MIX",
                     enableGovernor, enableClosedLoop, enableBodyLoop,
                     p.vx, p.vy, p.omega,
-                    slotPwm[0], slotPwm[1], slotPwm[2], slotPwm[3], faultMask);
+                    slotPwm[0], slotPwm[1], slotPwm[2], slotPwm[3], faultMask, (int)simDeadEnc);
       break;
     }
     default:
@@ -642,6 +702,16 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     return;
   }
 
+#if ESPNOW_ENCRYPT
+  // Registering an encrypted peer does not stop OTHER devices' plaintext frames
+  // from reaching this callback, and after WATCHDOG_MS of silence the link gate
+  // would lock onto one. With encryption on, only the configured controller counts.
+  if (memcmp(info->src_addr, CONTROLLER_MAC, 6) != 0) {
+    foreignDrops = foreignDrops + 1;
+    return;
+  }
+#endif
+
   // Serial test mode owns the drive and ignores radio commands, but a radio
   // E-STOP still stops it: on the floor, the handheld e-stop is the only stop
   // within reach. From any sender, stale or not — an e-stop is never stale.
@@ -656,9 +726,15 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   if (v == LINK_FOREIGN) foreignDrops = foreignDrops + 1;
   if (v != LINK_ACCEPT) return;
 
+  // Re-check test mode INSIDE the lock: a serial `t`/`s` landing between the check
+  // above and this write would otherwise be overwritten by this radio frame, and
+  // test mode then keeps that frame fresh. handleCommand sets testMode before its
+  // own locked write, so whichever order the two cores take, the test packet wins.
   portENTER_CRITICAL(&pktMux);
-  lastPacket   = in;
-  lastPacketMs = millis();
+  if (!testMode) {
+    lastPacket   = in;
+    lastPacketMs = millis();
+  }
   portEXIT_CRITICAL(&pktMux);
 }
 
@@ -684,8 +760,13 @@ static void setupEspNow() {
   WiFi.disconnect();
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.print("Robot MAC: ");
-  Serial.println(WiFi.macAddress());
+  // Factory STA MAC from eFuse. WiFi.macAddress() printed 00:00:00:00:00:00 here on
+  // Arduino core 3.x (the netif isn't up yet), and secrets.h ROBOT_MAC is copied
+  // from this line.
+  uint8_t mac[6] = {};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("Robot MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init FAILED");
@@ -693,8 +774,8 @@ static void setupEspNow() {
   }
 
 #if ESPNOW_ENCRYPT
-  // Set the primary key, then register the controller as an encrypted peer so
-  // the robot will accept (and only accept) encrypted frames from it (#3).
+  // Set the primary key, then register the controller as an encrypted peer so its
+  // frames decrypt (#3). Frames from other senders are dropped in onRecv by MAC.
   esp_now_set_pmk((const uint8_t*)ESPNOW_PMK);
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, CONTROLLER_MAC, 6);
@@ -711,6 +792,7 @@ static void setupEspNow() {
 }
 
 // ---------------- Loop watchdog ----------------
+static bool loopWdtArmed = false;   // re-warned every second from loop() if false
 // Subscribe the Arduino loop task to the task watchdog with a LOOP_WDT_MS timeout.
 // The control tick feeds it. If loop() hangs, the ISR hook (wdt_hook.cpp) drops
 // every direction pin LOW and the panic reboots the chip; the LEDC duty alone
@@ -724,22 +806,16 @@ static void setupLoopWatchdog() {
   esp_err_t e = esp_task_wdt_reconfigure(&cfg);
   if (e == ESP_ERR_INVALID_STATE) e = esp_task_wdt_init(&cfg);  // core didn't start it
   if (e == ESP_OK) e = esp_task_wdt_add(NULL);                  // NULL = this task (loopTask)
-  if (e == ESP_OK) Serial.printf("loop watchdog armed (%lu ms)\n", (unsigned long)LOOP_WDT_MS);
-  else             Serial.printf("WARN loop watchdog NOT armed: %s\n", esp_err_to_name(e));
+  loopWdtArmed = (e == ESP_OK);
+  if (loopWdtArmed) Serial.printf("loop watchdog armed (%lu ms)\n", (unsigned long)LOOP_WDT_MS);
+  else              Serial.printf("WARN loop watchdog NOT armed: %s\n", esp_err_to_name(e));
 }
 
 // ---------------- main ----------------
 void setup() {
-  // TX ring buffer (must precede begin). The default is none, so a log line longer
-  // than the 128-byte UART FIFO blocks loop() until its tail drains at 115200 —
-  // ~4-6 ms per TLM/status line, inside a 10 ms control tick. TLM peaks near
-  // 4 kB/s against an 11.5 kB/s drain, so the buffer never fills.
-  Serial.setTxBufferSize(1024);
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("\nmecanum robot: ESP-NOW + mecanum kinematics");
-  Serial.printf("reset reason: %s\n", resetReasonStr(esp_reset_reason()));
-
+  // Motor outputs FIRST: between reset and here the driver inputs float. Driving
+  // INA/INB LOW and the PWM to 0 before the serial banner and its 200 ms delay
+  // keeps that window as short as the boot itself.
   uint32_t dirLo = 0, dirHi = 0;
   for (uint8_t i = 0; i < 4; i++) {
     const Motor& m = motors[i];
@@ -757,10 +833,27 @@ void setup() {
   g_motorDirMaskLo = dirLo;   // for the watchdog ISR hook (wdt_hook.cpp)
   g_motorDirMaskHi = dirHi;
 
+  // TX ring buffer (must precede begin). The default is none, so a log line longer
+  // than the 128-byte UART FIFO blocks loop() until its tail drains at 115200 —
+  // ~4-6 ms per TLM/status line, inside a 10 ms control tick. TLM peaks near
+  // 4 kB/s against an 11.5 kB/s drain, so the buffer never fills.
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nmecanum robot: ESP-NOW + mecanum kinematics");
+  Serial.printf("reset reason: %s\n", resetReasonStr(esp_reset_reason()));
+
   // All four encoders must come up: a wheel that reads 0 ticks would be driven to
   // full PWM by its PI loop. loop() holds the motors stopped while encReady is false.
+  // The PCNT driver requests the internal pull-up on every encoder pin; GPIO34-39
+  // are input-only and have none, so the gpio driver logged 8 harmless "GPIO
+  // number error" lines at boot. Mute that tag just for this block; each unit's
+  // setup result is still checked (encReady).
+  const esp_log_level_t gpioLog = esp_log_level_get("gpio");
+  esp_log_level_set("gpio", ESP_LOG_NONE);
   encReady = true;
   for (uint8_t i = 0; i < 4; i++) encReady = setupEncoder(i) && encReady;
+  esp_log_level_set("gpio", gpioLog);
 
   setupEspNow();
   pidReset();
@@ -794,6 +887,14 @@ void loop() {
     lastEncWarnMs = now;
     Serial.println("WARN encoder PCNT init failed — drive disabled (motors held stopped)");
   }
+  // A failed watchdog arm leaves driving allowed (the kart works, the hang
+  // protection is what's missing), so it re-warns like the others instead of
+  // scrolling away after one line.
+  static uint32_t lastWdtWarnMs = 0;
+  if (!loopWdtArmed && now - lastWdtWarnMs >= 1000) {
+    lastWdtWarnMs = now;
+    Serial.println("WARN loop watchdog NOT armed — no hang protection");
+  }
 
   // Radio e-stop during a bench test (flagged by onRecv): abort test mode, stopped.
   if (radioEstopReq) {
@@ -819,8 +920,10 @@ void loop() {
   if (!tickStarted || (int32_t)(nowUs - nextTickUs) >= 0) {
     // True elapsed time since the previous tick (us resolution; millis() quantized
     // dt to whole ms, a 10% error on a 10 ms tick).
-    float dt = tickStarted ? (float)(uint32_t)(nowUs - lastTickUs) * 1e-6f
-                           : (float)CTRL_PERIOD_US * 1e-6f;
+    float dtMeas = tickStarted ? (float)(uint32_t)(nowUs - lastTickUs) * 1e-6f
+                               : (float)CTRL_PERIOD_US * 1e-6f;
+    if (dtMeas <= 0.0f) dtMeas = 0.01f;
+    float dt = dtMeas;
     tickStarted = true;
     lastTickUs  = nowUs;
     // Fixed rate: the next tick is due one period after this one was DUE, so loop
@@ -830,12 +933,11 @@ void loop() {
     if ((int32_t)(nowUs - nextTickUs) >= 0) nextTickUs = nowUs + CTRL_PERIOD_US;
     esp_task_wdt_reset();   // the control tick is what the loop watchdog guards
 
-    if (dt <= 0.0f) dt = 0.01f;
-    // (BUG-009) Clamp dt to ~2x nominal. A delayed tick (the 500ms serial log or an
-    // ESP-NOW callback burst runs in this same loop) would otherwise inflate dt and
-    // simultaneously enlarge the CMD_SLEW step, PWM_SLEW step, PID integral step and
-    // body integral step — one coordinated control lurch, worst under payload where
-    // errors are large. The same unbounded dt also widened the encoder glitch clamp.
+    // (BUG-009) Clamp the CONTROL dt to 50 ms (5x nominal). A delayed tick would
+    // otherwise inflate dt and simultaneously enlarge the CMD_SLEW step, PWM_SLEW
+    // step, PID integral step and body integral step — one coordinated control
+    // lurch, worst under payload where errors are large. Speed is still measured
+    // over dtMeas, the real time the encoder delta spans (pidStep).
     if (dt > 0.05f) dt = 0.05f;
 
     CtrlPacket p;
@@ -849,26 +951,39 @@ void loop() {
     age = linkAgeMs(now, lastPacketMs);   // onRecv may stamp after `now` was read
     portEXIT_CRITICAL(&pktMux);
 
-    const bool linkOk = age <= WATCHDOG_MS;
-    const bool estop  = (p.flags & CTRL_FLAG_ESTOP) != 0;
-
-    // A latched drive fault clears after FAULT_CLEAR_MS of neutral sticks (or
-    // e-stop) on a live link: the operator lets go, then tries again.
-    if (driveFault) {
-      bool idle = linkOk && (estop || (p.vx == 0 && p.vy == 0 && p.omega == 0));
-      if (!idle) faultIdleSinceMs = now;
-      else if (now - faultIdleSinceMs >= FAULT_CLEAR_MS) clearDriveFault("sticks neutral");
+    // Drive gate (safety.h): one decision for "may the motors run", with the fault
+    // latch (clears after FAULT_CLEAR_MS of neutral) and the link latch (after a
+    // link loss, the first frame obeyed must be neutral). Neutral = zero twist AND
+    // no direct-mode PWM, so `m` can't resume itself after a fault.
+    bool directPwm = false;
+    if (testMode && testSrc == TS_DIRECT)
+      for (int i = 0; i < 4; i++) if (slotPwm[i] != 0) directPwm = true;
+    DriveGateIn gin;
+    gin.encReady = encReady;
+    gin.linkOk   = age <= WATCHDOG_MS;
+    gin.estop    = (p.flags & CTRL_FLAG_ESTOP) != 0;
+    gin.neutral  = p.vx == 0 && p.vy == 0 && p.omega == 0 && !directPwm;
+    gin.testMode = testMode;
+    DriveGateOut gout = driveGateStep(&gate, gin, now, FAULT_CLEAR_MS);
+    if (gout.faultCleared) {
+      faultMask = 0;
+      for (int i = 0; i < 4; i++) faultState[i].ms = 0.0f;
+      Serial.println("FAULT cleared (sticks neutral)");
     }
+    if (gout.linkLatched && !wasStopped)
+      Serial.println("LINK LOST - stopped; centre the sticks to resume once the link is back");
+    if (gout.linkReleased && !testMode)
+      Serial.println("link ready (neutral frame received)");
 
-    if (!encReady || !linkOk || estop || driveFault) {
+    if (gout.stop) {
       stopDrive();
     } else if (testMode && testSrc == TS_DIRECT) {
+      pidReset();   // first: it zeroes lastOutPwm, which then records the real output
       for (int i = 0; i < 4; i++) {
         motorWrite(i, slotPwm[i]);
-        lastOutPwm[i] = (float)slotPwm[i];
+        lastOutPwm[i] = (float)slotPwm[i];   // telemetry pwm= and the m -> t handoff
         lastTargetTps[i] = 0;
       }
-      pidReset();
       wasStopped = false;
     } else {
       // Field control: mirror the controller's selected mode (DISABLE bits) into
@@ -1005,19 +1120,19 @@ void loop() {
       }
 
       for (int i = 0; i < 4; i++) lastDriveCmd[i] = driveCmd[i];
-      uint8_t tripped = pidStep(driveCmd, dt);
+      uint8_t tripped = pidStep(driveCmd, dt, dtMeas);
       if (tripped) {
-        driveFault       = true;
-        faultMask        = tripped;
-        faultIdleSinceMs = now;
+        driveGateTrip(&gate, now);
+        faultMask = tripped;
         motorStopAll();
         pidReset();
         wasStopped = true;
-        char names[16] = "";
+        char names[40] = "";
         for (int i = 0; i < 4; i++) {
           if (!(tripped & (1u << i))) continue;
-          if (names[0]) strcat(names, " ");
-          strcat(names, WHEEL_NAME[i]);
+          char one[16];
+          snprintf(one, sizeof(one), "%s%s (slot %d)", names[0] ? ", " : "", RIDER_NAME[i], i);
+          strncat(names, one, sizeof(names) - strlen(names) - 1);
         }
         Serial.printf("FAULT %s: driven at >=%.0f%% PWM with no encoder motion for %.0f ms "
                       "(dead encoder or jammed wheel) - all motors stopped. "
@@ -1057,7 +1172,7 @@ void loop() {
                   (unsigned long)p.seq, p.vx, p.vy, p.omega, state,
                   lastMeasTps[0], lastMeasTps[1], lastMeasTps[2], lastMeasTps[3],
                   (unsigned long)crcDrops, (unsigned long)foreignDrops, batt, stall,
-                  driveFault ? " FAULT" : "",
+                  gate.fault ? " FAULT" : (gate.linkLatch ? " LINK-LATCHED" : ""),
                   fresh ? "" : " (stale)");
     lastSeen = p.seq;
   }

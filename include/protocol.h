@@ -8,8 +8,11 @@
 // silence it accepts the next valid frame from anyone (safety.h linkGateCheck).
 struct __attribute__((packed)) CtrlPacket {
   uint32_t seq;       // monotonic counter; robot accepts only newer seq (dedup)
-  int16_t  vx;        // -1000..+1000 (forward+)
-  int16_t  vy;        // -1000..+1000 (strafe right+)
+  // Twist in the ROBOT FIRMWARE frame. The rider faces the firmware's rear, so the
+  // controller sends rider-forward as vx < 0 and rider-right as vy < 0
+  // (config_controller.h INVERT_VX/VY). Rotation is the same in both frames.
+  int16_t  vx;        // -1000..+1000 (firmware forward+)
+  int16_t  vy;        // -1000..+1000 (firmware strafe right+)
   int16_t  omega;     // -1000..+1000 (CCW+)
   uint8_t  buttons;   // bit0=LeftBtn, bit1=RightBtn, bit2=LeftJoyBtn, bit3=RightJoyBtn
   uint8_t  flags;     // bit0=estop; bits1-3 = feature DISABLE bits (see below)

@@ -25,9 +25,10 @@ except ImportError:
     sys.stderr.write("error: pyserial not installed. run: pip install pyserial\n")
     sys.exit(1)
 
-from tlm import KEEPALIVE_S, parse_tlm
+from tlm import KEEPALIVE_S, RIDER_NAME, parse_tlm
 
-SLOTS = ["FL", "FR", "RL", "RR"]
+# Rider's corner names (slots are named in the firmware frame; see tlm.py).
+SLOTS = RIDER_NAME
 
 
 def read_lines(ser, seconds):
@@ -118,11 +119,11 @@ def main() -> int:
 
     # Use the smaller of fwd/rev per wheel: it's the rate that limits closed-loop.
     maxtps = [min(fwd[i], rev[i]) for i in range(4)]
-    print("\nPaste into include/config_robot.h (slot order [FL,FR,RL,RR]):")
+    print("\nPaste into include/config_robot.h (slot order 0..3 = firmware [FL,FR,RL,RR] = rider [RR,RL,FR,FL]):")
     print(f"static const float MAX_TPS[4] = {{ {maxtps[0]:.0f}.0f, {maxtps[1]:.0f}.0f, "
           f"{maxtps[2]:.0f}.0f, {maxtps[3]:.0f}.0f }};")
     weakest = min(maxtps)
-    print(f"\nWeakest wheel = {weakest:.0f} tps ({SLOTS[maxtps.index(weakest)]})."
+    print(f"\nWeakest wheel = {weakest:.0f} tps (rider's {SLOTS[maxtps.index(weakest)]}, slot {maxtps.index(weakest)})."
           " cmd 1000 targets SPEED_REF_FRAC of it (verify_sweep.py reads config_robot.h).")
     if weakest > 0 and max(maxtps) / weakest > 1.2:
         print("NOTE: >20% spread across wheels — the two battery halves are mismatched."

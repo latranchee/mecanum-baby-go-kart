@@ -5,18 +5,14 @@
 // Wheel command in [-1000..+1000] (thousandths of max wheel speed).
 // X-pattern rollers, slot map: M1=FL, M2=FR, M3=RL, M4=RR.
 //
-// STRAFE-SIGN CAVEAT (audit 2026-06-02, unresolved on hardware):
-//   protocol.h declares vy = strafe-RIGHT(+) and the controller maps stick-right
-//   -> +vy, but the matrix below is the textbook vy=+LEFT form: pure vy>0 gives
-//   wheel signs {FL-, FR+, RL+, RR-}, which is the strafe-LEFT pattern. So by the
-//   book, commanding "strafe right" would translate the robot LEFT.
-//   NOT changed here: test_mix_strafe_diagonal_opposite locks this exact mapping
-//   and no strafe fault has been reported, so the physical roller handedness on
-//   this build may already make {FL-,FR+,RL+,RR-} = right. Forward (all +) and
-//   rotate are unaffected either way.
-//   To verify on the floor: in robot test mode send `t 0 500 0` (vy=+500). If the
-//   robot strafes LEFT, the sign is wrong — flip the vy terms below (FL+vy, FR-vy,
-//   RL-vy, RR+vy) and update the test. If it strafes RIGHT, leave as-is.
+// FRAME NOTE (2026-10-05): every name here (FL/FR/RL/RR, vx forward, vy right) is
+// the FIRMWARE frame. The rider faces the firmware's rear: the controller sends
+// vx and vy negated (config_controller.h INVERT_VX/VY), a 180-degree turn, and
+// slot 0 ("FL") was bench-confirmed as the rider's rear-right. The rider's stick
+// directions are correct in use; the old 2026-06-02 strafe-sign caveat (textbook
+// vy=+LEFT matrix vs. "vy strafe-right+") is moot from the rider's side, because
+// the controller's inversion is what was tuned against the real cart. Do not flip
+// signs here without re-checking the controller inversions with it.
 // Scale a 4-wheel command set so its peak magnitude does not exceed `limit`,
 // preserving the ratio between wheels (direction unchanged). `limit` must be > 0.
 // Used by mecanumMix AND by the drive loop to re-normalize the governor-scaled

@@ -24,9 +24,9 @@ valid frame from any transmitter, so a rebooted controller is picked up at once.
 
 | Event | Robot response |
 |---|---|
-| No valid packet for 500 ms | Motors stop (link watchdog) |
+| No valid packet for 500 ms | Motors stop (link watchdog). **Latched**: driving resumes only after a neutral (or e-stop) frame, so a flaky link can't relaunch the cart at a held stick. Also true at boot |
 | E-stop flag | Motors stop and stay stopped while the flag is sent |
-| A wheel at ≥30% PWM with no encoder motion for 300 ms (dead encoder, jammed wheel) | **Drive fault**: all motors stop, `FAULT FL ...` on serial. Clears after 1 s of neutral sticks, or `r`/`x` on the bench |
+| A wheel at ≥30% PWM turning under 150 ticks/s for 300 ms (dead encoder, jammed wheel) | **Drive fault**: all motors stop, `FAULT RR (slot 0) ...` on serial (rider's corner name). Clears after 1 s of neutral sticks on a live link, or `r`/`x` on the bench |
 | `loop()` hangs for 500 ms | Task watchdog: every direction pin driven LOW, then reboot |
 | Bench test: no serial line for 1 s while driving | Test stops (`k` is the keepalive) |
 | Bench test: radio e-stop | Test mode aborted, motors stopped |
@@ -43,8 +43,11 @@ The AtomS3 status bar shows one word, highest priority first:
 | `CENTER` | Not armed: release and centre both sticks |
 | `ONLINE` / `OFFLINE` | Armed; the robot's radio is / isn't acknowledging |
 
-- **Stick centre** is taken from 16 readings at rest near mid-scale. A stick held at
-  power-on is refused (the controller keeps trying until the sticks are released).
+- **Stick centre** is taken from 16 readings at rest, accepted only within 45 counts
+  of this joystick's measured rest position (`CENTER_REST` in `config_controller.h`).
+  That is inside the deadzone, so a stick held at power-on is either refused (the
+  controller keeps trying until the sticks are released) or too close to rest to
+  move the cart. A different joystick unit needs its own `CENTER_REST`.
 - **Arming**: the controller sends drive commands only when armed. It starts
   disarmed; the e-stop and a joystick fault disarm it. It re-arms when the e-stop is
   released and every stick is centred. While disarmed it sends the e-stop flag, so
@@ -55,12 +58,26 @@ The AtomS3 status bar shows one word, highest priority first:
 
 ## Wheel layout
 
-Top-down, robot facing forward. Slot index = array index in `motors[]`:
+The firmware names wheels in ITS frame (slot index = array index in `motors[]`).
+**The rider faces the firmware's rear**: the controller inverts `vx` and `vy`
+(`INVERT_VX`/`INVERT_VY` in `config_controller.h`), a 180° turn. Bench-confirmed
+2026-10-05: slot 0 is the rider's rear-right wheel.
+
+| Slot | Firmware name | Rider's corner |
+|---|---|---|
+| 0 | FL | **RR** (rear-right) |
+| 1 | FR | **RL** (rear-left) |
+| 2 | RL | **FR** (front-right) |
+| 3 | RR | **FL** (front-left) |
+
+Everything printed for a human (fault messages, `d`, calibration output) uses the
+rider's names, with the slot number.
 
 ```
-   M1 (FL) ---- M2 (FR)
-      |            |
-   M3 (RL) ---- M4 (RR)
+   firmware frame (top-down)        rider's view (top-down, rider facing up)
+   slot0 FL ---- slot1 FR           slot3 ---- slot2        (front)
+      |              |                |           |
+   slot2 RL ---- slot3 RR           slot1 ---- slot0        (rear)
 ```
 
 X-pattern rollers. `mecanumMix(vx, vy, omega)` (`include/kinematics.h`):
@@ -72,8 +89,9 @@ X-pattern rollers. `mecanumMix(vx, vy, omega)` (`include/kinematics.h`):
 | RL | vx + vy − omega |
 | RR | vx − vy + omega |
 
-`vx` forward+, `vy` strafe-right+, `omega` CCW+, each in [−1000, +1000]. Output is
-scaled down if any wheel saturates past ±1000.
+`vx` forward+, `vy` strafe-right+, `omega` CCW+, each in [−1000, +1000], all in the
+**firmware** frame (so the rider's forward is `vx` < 0). Output is scaled down if
+any wheel saturates past ±1000.
 
 ## Hardware / wiring
 
@@ -127,9 +145,11 @@ Send commands over the 115200 serial console (or via `tools/joyctl.py`):
 | `t <vx> <vy> <omega>` | mix path: kinematics → PID → motors (each −1000..+1000) |
 | `m <slot> <pwm>` | direct path: raw PWM on one slot (slot 0..3, pwm −1023..+1023) |
 | `s` | stop (zero everything) |
-| `r` | zero encoder counters + reset PID, clear a drive fault |
-| `x` | exit test mode (ESP-NOW control resumes), clear a drive fault |
+| `r` | stop + zero encoder counters + reset PID + clear a drive fault (test mode only) |
+| `x` | exit test mode (ESP-NOW control resumes), clear a drive fault; no-op outside test mode |
 | `k` | keepalive (silent) |
+| `d <slot>` | bench fault test: freeze that wheel's encoder like a disconnected one (`d -1` = off; cleared on `x`) |
+| `g` / `c` / `b` `<0\|1>` | governor / closed loop / body loop on or off (test mode; in the field the controller's mode owns them) |
 | `?` | print one-shot status |
 
 A test that drives stops if no serial line arrives for 1 s. The Python tools send
@@ -145,14 +165,14 @@ governor and body correction).
 ## tools/
 
 Python helpers (need `pyserial`: `pip install pyserial`). Each takes the robot's
-COM port as an optional first arg.
+COM port as `--port COMx` (default COM8).
 
 | Tool | Purpose |
 |------|---------|
-| `joyctl.py [PORT]` | REPL to stream telemetry + send `t/s/r/x/?`; `--sweep` runs a stimulus sequence, logs per-test CSVs, prints a summary |
+| `joyctl.py` | REPL to stream telemetry + send `t/s/r/x/?`; `--sweep` runs a stimulus sequence, logs per-test CSVs, prints a summary |
 | `verify_sweep.py` | check the sweep CSVs against expected per-wheel encoder sign/magnitude (reads `encSign`/`MAX_TPS` from the firmware) |
-| `solo_test.py [PORT]` | drive each slot in isolation (direct PWM), capture mean `raw_tps` per slot |
-| `spin_fr.py [PORT]` | spin slot 1 (FR) and stream its `raw_tps` live (encoder-connector debugging) |
+| `solo_test.py` | drive each slot in isolation (direct PWM), capture mean `raw_tps` per slot |
+| `spin_fr.py` | spin one slot (default 1) and stream its `raw_tps` live (encoder-connector debugging) |
 | `calibrate_maxtps.py` | measure each wheel's full-PWM tick rate for `MAX_TPS[]` (wheels off the ground) |
 | `drive_watch.py` | drive a stimulus and flag a mid-run reboot (brownout hunting) |
 
