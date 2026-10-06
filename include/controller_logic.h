@@ -17,9 +17,18 @@
 // full deflection the other way and the cart drove with nobody touching it.
 //
 // Now the centre is accepted only from a set of `need` consecutive readings where
-// every axis averages within `tol` of the nominal mid-scale AND moved less than
-// `maxSpread` across the set (sticks at rest). Anything else rejects the set and
-// starts over, so the controller keeps trying until the sticks are released.
+// every axis averages within `tol` of THIS UNIT's measured rest position
+// (`rest[]`, per axis) AND moved less than `maxSpread` across the set (sticks at
+// rest). Anything else rejects the set and starts over, so the controller keeps
+// trying until the sticks are released.
+//
+// Why per-unit rest and a small tol (audit 2026-10-05): with tol measured from
+// mid-scale (2048) it had to be large (this unit rests up to ~130 counts off
+// mid-scale), and a stick held LIGHTLY at power-on still became the centre: on
+// release the cart crept (vx 66 / omega 48 at 50% speed). If tol + the rest's own
+// drift stays under the deadzone, any accepted centre lies within the deadzone of
+// the true rest, so a light hold can never produce motion after release
+// (static_assert in config_controller.h).
 // Axis order is the caller's (the firmware uses L horiz, L vert, R horiz, R vert).
 // Zero-initialized state is ready to use.
 struct StickCal {
@@ -31,7 +40,7 @@ struct StickCal {
 // Returns 0 while collecting, +1 when accepted (center[] written), -1 when the
 // set was rejected (collection restarts on the next call).
 static inline int stickCalAdd(StickCal* c, const uint16_t raw[4], uint8_t need,
-                              uint16_t nominal, uint16_t tol, uint16_t maxSpread,
+                              const uint16_t rest[4], uint16_t tol, uint16_t maxSpread,
                               uint16_t center[4]) {
   if (c->n == 0) {
     for (int i = 0; i < 4; i++) { c->sum[i] = 0; c->lo[i] = 0xFFFF; c->hi[i] = 0; }
@@ -47,7 +56,7 @@ static inline int stickCalAdd(StickCal* c, const uint16_t raw[4], uint8_t need,
   bool good = true;
   for (int i = 0; i < 4; i++) {
     avg[i] = (uint16_t)(c->sum[i] / c->n);
-    int32_t off = (int32_t)avg[i] - (int32_t)nominal;
+    int32_t off = (int32_t)avg[i] - (int32_t)rest[i];
     if (off < 0) off = -off;
     if (off > tol || (uint16_t)(c->hi[i] - c->lo[i]) > maxSpread) good = false;
   }
@@ -61,15 +70,15 @@ static inline int stickCalAdd(StickCal* c, const uint16_t raw[4], uint8_t need,
 // held stick can pass the tolerance; released, that stick then reads as a
 // deflection past the deadzone, so the controller can never re-arm and sits on
 // CENTER until rebooted. While disarmed the firmware keeps calibrating and adopts a
-// newly accepted centre per axis, but only where it is CLOSER to mid-scale than the
-// current one. A stick held while disarmed therefore never replaces its true rest
-// position (which sits nearer mid-scale), and the stuck case clears as soon as the
+// newly accepted centre per axis, but only where it is CLOSER to the unit's
+// measured rest than the current one. A stick held while disarmed therefore never
+// replaces its true rest position, and the stuck case clears as soon as the
 // sticks rest. Returns true if any axis moved.
-static inline bool centerImprove(uint16_t cur[4], const uint16_t cand[4], uint16_t nominal) {
+static inline bool centerImprove(uint16_t cur[4], const uint16_t cand[4], const uint16_t rest[4]) {
   bool moved = false;
   for (int i = 0; i < 4; i++) {
-    int32_t dc = (int32_t)cur[i]  - (int32_t)nominal;
-    int32_t dn = (int32_t)cand[i] - (int32_t)nominal;
+    int32_t dc = (int32_t)cur[i]  - (int32_t)rest[i];
+    int32_t dn = (int32_t)cand[i] - (int32_t)rest[i];
     if (dc < 0) dc = -dc;
     if (dn < 0) dn = -dn;
     if (dn < dc) { cur[i] = cand[i]; moved = true; }

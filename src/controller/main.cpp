@@ -3,10 +3,12 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>            // esp_read_mac()
 #include "protocol.h"
 #include "config_controller.h"  // pulls in curve.h (CurveCfg/CURVE) + tunables
 #include "control_math.h"       // normalize(), clampI32(), crc8()
 #include "controller_logic.h"   // stick calibration, arming, mode-click gesture
+#include "safety.h"             // linkAgeMs()
 
 // Atom JoyStick: AtomS3 (ESP32-S3) + STM32 co-processor at I2C 0x59.
 // I2C: SDA=GPIO38, SCL=GPIO39, 400kHz on Wire1 (matches original firmware).
@@ -30,7 +32,7 @@ static const int I2C_SCL = 39;
 // "Left/Right" below = USER's physical sticks (not M5 reg labels — see above).
 // Axis order used by the calibration arrays: L horiz, L vert, R horiz, R vert.
 enum Axis : uint8_t { AX_LH = 0, AX_LV = 1, AX_RH = 2, AX_RV = 3 };
-static uint16_t center[4] = { CENTER_NOMINAL, CENTER_NOMINAL, CENTER_NOMINAL, CENTER_NOMINAL };
+static uint16_t center[4] = { CENTER_REST[0], CENTER_REST[1], CENTER_REST[2], CENTER_REST[3] };
 
 // DEADZONE_RAW / HALF_RANGE in config_controller.h. CurveCfg/CURVE in curve.h
 // (via config_controller.h); applyCurve() in curve.h.
@@ -85,8 +87,12 @@ static void setupEspNow() {
   WiFi.disconnect();
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.print("Controller MAC: ");
-  Serial.println(WiFi.macAddress());
+  // Factory STA MAC from eFuse (WiFi.macAddress() can read all zeros this early on
+  // Arduino core 3.x). secrets.h CONTROLLER_MAC is copied from this line.
+  uint8_t mac[6] = {};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("Controller MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init FAILED");
@@ -170,7 +176,9 @@ static StatusView currentView(uint32_t now) {
   if (joyFails >= JOY_FAIL_TRIP) return SV_JOY_ERR;    // sticks unreadable: e-stop sent
   if (estopHeld)                 return SV_ESTOP;
   if (!calibrated || !armed)     return SV_CENTER;     // release / centre the sticks
-  return (now - lastAckMs) < 500 ? SV_ONLINE : SV_OFFLINE;
+  // Signed age: onSent stamps lastAckMs on core 0 and can land after `now` was
+  // read here; an unsigned difference wrapped and flashed OFFLINE for a refresh.
+  return linkAgeMs(now, lastAckMs) < 500 ? SV_ONLINE : SV_OFFLINE;
 }
 
 static void drawHeader() {
@@ -337,10 +345,12 @@ void loop() {
   if (joyFails >= JOY_FAIL_TRIP) Serial.println("JOY ERR cleared");
   joyFails = 0;
 
-  // Stick centre: only from a set of readings taken at rest near mid-scale.
-  // Until then nothing is sent (the robot is stopped by its own watchdog).
+  // Stick centre: only from a set of readings taken at rest, within CENTER_TOL of
+  // this unit's measured rest (config_controller.h CENTER_REST). Until then
+  // nothing is sent (the robot is stopped by its own watchdog).
   if (!calibrated) {
-    int r = stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_NOMINAL, CENTER_TOL, CENTER_SPREAD, center);
+    static uint16_t rejects = 0;
+    int r = stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_REST, CENTER_TOL, CENTER_SPREAD, center);
     if (r > 0) {
       calibrated = true;
       Serial.printf("Centers: L=(h%u,v%u) R=(h%u,v%u)\n",
@@ -348,6 +358,12 @@ void loop() {
     } else if (r < 0) {
       Serial.printf("calibration rejected (stick held or moving): L=(h%u,v%u) R=(h%u,v%u)\n",
                     raw[AX_LH], raw[AX_LV], raw[AX_RH], raw[AX_RV]);
+      // ~5 s of rejections: if the sticks ARE released, the unit's rest has moved
+      // off CENTER_REST (or this is a different joystick). Say so once.
+      if (++rejects == 16)
+        Serial.printf("hint: if the sticks are released, update CENTER_REST in "
+                      "config_controller.h to the values above (now %u/%u/%u/%u, tol %u)\n",
+                      CENTER_REST[0], CENTER_REST[1], CENTER_REST[2], CENTER_REST[3], CENTER_TOL);
     }
     refreshDisplay(now, nullptr);
     return;
@@ -371,13 +387,13 @@ void loop() {
   estopHeld = (btnMask & BTN_ESTOP) == BTN_ESTOP;
 
   // Disarmed (and not e-stopping): keep calibrating in the background and move
-  // each axis centre only toward mid-scale (controller_logic.h centerImprove), so
+  // each axis centre only toward its measured rest (controller_logic.h centerImprove), so
   // a centre caught off a lightly held stick can't leave the controller stuck on
   // CENTER, and a stick held now can't become the centre.
   if (!armed && !estopHeld) {
     uint16_t cand[4];
-    if (stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_NOMINAL, CENTER_TOL, CENTER_SPREAD, cand) > 0 &&
-        centerImprove(center, cand, CENTER_NOMINAL)) {
+    if (stickCalAdd(&cal, raw, CAL_SAMPLES, CENTER_REST, CENTER_TOL, CENTER_SPREAD, cand) > 0 &&
+        centerImprove(center, cand, CENTER_REST)) {
       Serial.printf("Centers refined: L=(h%u,v%u) R=(h%u,v%u)\n",
                     center[AX_LH], center[AX_LV], center[AX_RH], center[AX_RV]);
     }
@@ -437,7 +453,7 @@ void loop() {
     lastLogMs = now;
     Serial.printf("seq=%lu spd=%u%% mode=%s btn=%02X armed=%d conn=%d L=(h%u,v%u) R=(h%u,v%u) -> vx=%d vy=%d w=%d\n",
                   (unsigned long)seq, speedPct, MODE_PRESETS[modeIdx].name, btnMask, armed ? 1 : 0,
-                  (now - lastAckMs) < 500 ? 1 : 0,
+                  linkAgeMs(now, lastAckMs) < 500 ? 1 : 0,
                   raw[AX_LH], raw[AX_LV], raw[AX_RH], raw[AX_RV], vx, vy, omega);
   }
 }

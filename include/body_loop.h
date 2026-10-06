@@ -71,7 +71,8 @@ static inline float bl_rate(float cur, float tgt, float maxStep) {
   return cur + d;
 }
 
-//   vx_c,vy_c,w_c  : commanded body twist (cmd units, the packet's vx/vy/omega).
+//   vx_c,vy_c,w_c  : commanded body twist (cmd units): the twist the slewed base
+//                    command expresses (mixInverse of curCmd), not the raw packet.
 //   vx_m,vy_m,w_m  : measured (IIR-filtered) body twist from forwardKinematics().
 //   freezeIntegral : true => governor owns magnitude (saturation/throttle/slip):
 //                    decay the integral AND drop the proportional term (BUG-006/007).

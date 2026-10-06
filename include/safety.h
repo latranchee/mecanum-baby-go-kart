@@ -75,3 +75,69 @@ static inline bool driveFaultStep(DriveFault* f, float pwm, float measTps,
   else                               f->ms = 0.0f;
   return f->ms >= tripMs;
 }
+
+// Drive gate: the single "may the motors run this tick?" decision, plus the two
+// latches that need neutral sticks to release.
+//
+//   fault     : set by driveGateTrip() when a drive fault trips. Clears after
+//               clearMs of neutral sticks (or e-stop) on a LIVE link.
+//   linkLatch : set whenever the radio link is lost (watchdog). Clears on the
+//               first fresh frame that is neutral (or e-stop). Without it, a
+//               marginal link stopped and relaunched the cart at whatever the
+//               stick held, over and over. Also set at boot (no frame yet), so
+//               the first command a robot obeys is a neutral one.
+//
+// Serial test mode has its own link watchdog (test-link) and a forced-fresh
+// packet, so the link latch neither sets nor holds there. Pure logic, host-tested.
+struct DriveGate {
+  bool     fault;
+  bool     linkLatch;
+  uint32_t idleSinceMs;   // start of the neutral window that clears a fault
+};
+
+struct DriveGateIn {
+  bool encReady;   // all encoder units counting
+  bool linkOk;     // fresh frame within the watchdog
+  bool estop;      // e-stop flag on the current frame
+  bool neutral;    // current command is zero (twist and any direct PWM)
+  bool testMode;   // serial bench mode owns the drive
+};
+
+struct DriveGateOut {
+  bool stop;          // hold the motors stopped this tick
+  bool faultCleared;  // the fault latch released on this tick
+  bool linkLatched;   // the link latch engaged on this tick
+  bool linkReleased;  // the link latch released on this tick
+};
+
+static inline void driveGateTrip(DriveGate* g, uint32_t nowMs) {
+  g->fault       = true;
+  g->idleSinceMs = nowMs;
+}
+
+static inline DriveGateOut driveGateStep(DriveGate* g, const DriveGateIn& in,
+                                         uint32_t nowMs, uint32_t clearMs) {
+  DriveGateOut o = { false, false, false, false };
+  const bool idle = in.linkOk && (in.estop || in.neutral);
+
+  if (in.testMode) {
+    if (g->linkLatch) { g->linkLatch = false; o.linkReleased = true; }
+  } else if (!in.linkOk) {
+    if (!g->linkLatch) { g->linkLatch = true; o.linkLatched = true; }
+  } else if (g->linkLatch && idle) {
+    g->linkLatch = false;
+    o.linkReleased = true;
+  }
+
+  if (g->fault) {
+    if (!idle) g->idleSinceMs = nowMs;
+    else if ((uint32_t)(nowMs - g->idleSinceMs) >= clearMs) {
+      g->fault = false;
+      o.faultCleared = true;
+    }
+  }
+
+  o.stop = !in.encReady || !in.linkOk || in.estop || g->fault ||
+           (g->linkLatch && !in.testMode);
+  return o;
+}

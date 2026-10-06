@@ -274,6 +274,18 @@ static void test_gov_wrong_way_wheel_floors(void) {
   TEST_ASSERT_EQUAL_FLOAT(0.1f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
 }
 
+static void test_gov_full_reversal_keeps_braking(void) {
+  // THE REGRESSION (review 2026-10-05): stick yanked forward -> reverse. Every
+  // wheel is still spinning forward while commanded (and saturated) backward. The
+  // governor read that as "all four failing" and floored the group, cutting the
+  // braking command to 10% during the emergency move. All wrong-way = deliberate
+  // reversal = no throttle.
+  int32_t cmd[4]  = { -1000, -1000, -1000, -1000 };
+  float   meas[4] = {  2000,  1900,  2100,  2000 };
+  float   out[4]  = { -1023, -1023, -1023, -1023 };
+  TEST_ASSERT_EQUAL_FLOAT(1.0f, speedGovernorScale(cmd, meas, out, GMAX, GPWM, GLO, GSAT, 0));
+}
+
 static void test_gov_uniform_load_no_spurious_throttle(void) {
   // BUG-001: ALL four wheels saturated (payload) and ALL sagging EQUALLY below the
   // no-load ref (ratio 0.6 each). The old absolute judge read "all four failing" and
@@ -412,7 +424,9 @@ static void test_fwd_uniform_ref_weak_wheel_reports_low(void) {
 // ---------------- bodyCorrection (body-space outer loop) ----------------
 static BodyLoopCfg body_cfg(void) {
   // kpTrans,kpW,kiTrans,kiW,iMax,wThresh,rateLimit,corrMax,yawFwdFrac,iDecay
-  BodyLoopCfg c = { 0.15f, 0.28f, 0.10f, 0.15f, 150.0f, 150.0f, 400.0f, 200.0f,
+  // Gains as in the original tests, but the rotation threshold is the SHIPPED
+  // BODY_W_THRESH (was a stale 150 here while the firmware runs 500).
+  BodyLoopCfg c = { 0.15f, 0.28f, 0.10f, 0.15f, 150.0f, BODY_W_THRESH, 400.0f, 200.0f,
                     0.5f, 3.0f };
   return c;
 }
@@ -711,15 +725,21 @@ static void test_clamp_slew_hard_limit_wins(void) {
 // ---------------- speed reference headroom ----------------
 
 static void test_full_cmd_feedforward_headroom(void) {
-  // cmd 1000 feed-forward ALONE must sit under the governor's saturation gate on
-  // every wheel, with margin. Otherwise full stick reads "saturated" at no load:
-  // the body loop freezes itself and the PI has no PWM left for a lagging wheel.
-  // Trips if SPEED_REF_FRAC is raised or MAX_TPS[] is recalibrated far apart.
+  // cmd 1000 feed-forward ALONE must sit under the governor's saturation gate, with
+  // margin. Otherwise full stick reads "saturated" at no load: the body loop
+  // freezes itself and the PI has no PWM left for a lagging wheel.
+  // What this can and cannot catch: the largest feed-forward is ALWAYS at the
+  // weakest wheel and equals PWM_MAX * SPEED_REF_FRAC exactly (refTps is defined
+  // from that wheel), so a MAX_TPS recalibration can never trip it. It pins
+  // SPEED_REF_FRAC against GOV_SAT_FRAC, nothing more.
   const float gate = (GOV_SAT_FRAC - 0.03f) * (float)PWM_MAX;
+  float worst = 0.0f;
   for (int i = 0; i < 4; i++) {
     float ff = (float)PWM_MAX / MAX_TPS[i] * cmdRefTps();
-    TEST_ASSERT_TRUE(ff < gate);
+    if (ff > worst) worst = ff;
   }
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, (float)PWM_MAX * SPEED_REF_FRAC, worst);  // the identity above
+  TEST_ASSERT_TRUE(worst < gate);
 }
 
 // ---------------- crc8 ----------------
@@ -787,6 +807,7 @@ int main(void) {
   RUN_TEST(test_gov_uniform_ref_sagging_wheel_drags);
   RUN_TEST(test_gov_throttled_wheel_does_not_latch);
   RUN_TEST(test_gov_wrong_way_wheel_floors);
+  RUN_TEST(test_gov_full_reversal_keeps_braking);
   RUN_TEST(test_gov_uniform_load_no_spurious_throttle);
   RUN_TEST(test_gov_relative_lagging_corner_still_drags);
   RUN_TEST(test_gov_relax_pure_spin_disables);

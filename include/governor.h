@@ -35,7 +35,8 @@
 //   measTps[] : last measured ticks/sec per wheel (signed, encSign-corrected)
 //   outPwm[]  : last commanded PWM per wheel (signed, |.| <= pwmMax)
 //   refTps    : UNIFORM target reference — cmd magnitude 1000 == refTps for every
-//               wheel (= the weakest wheel's max, so all can reach it). Used only to
+//               wheel (= SPEED_REF_FRAC x the weakest wheel's max, so all can reach
+//               it with headroom; config_robot.h cmdRefTps()). Used only to
 //               turn each wheel's command into a target speed; the GROUP scale is
 //               judged RELATIVE to the best-tracking wheel, not against this absolute
 //               (see GROUP-RELATIVE note below).
@@ -64,6 +65,22 @@
 //   valid[]   : false for wheels with no usable encoder (open-loop); skipped.
 //               Pass nullptr to treat all four as valid.
 //
+// REVERSAL (audit 2026-10-05): when EVERY commanded wheel is turning against its
+// command, the cart is braking through a deliberate reversal (stick yanked from
+// forward to reverse), not failing. Judging that as "all wheels at ratio 0" floored
+// the group to loScale and cut the braking command to 10% exactly during the
+// emergency move (stops ~7-10% longer in simulation). That case now returns 1.0.
+// A SINGLE wrong-way wheel among tracking ones is still a dragged/held corner and
+// still floors the group.
+//
+// KNOWN LIMIT (audit 2026-10-05, simulated, not fixed): ratios are judged against
+// the UN-throttled command, so an unsaturated wheel tracking its throttled target
+// reads ratio = current scale. With one wheel pinned at its ceiling the scale
+// therefore settles near sqrt(laggard ratio) instead of the ratio, leaving a
+// residual mismatch (and yaw) when a weak pair runs out of PWM. The two simple
+// alternatives tried (count headroom as 1.0; judge against governed targets)
+// both ratchet speed down under heavy load. Needs a redesign + floor test.
+//
 // Pure integer/float math, no Arduino deps — host-testable.
 static inline float speedGovernorScale(const int32_t cmd[4], const float measTps[4],
                                         const float outPwm[4], float refTps, float pwmMax,
@@ -72,6 +89,7 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
   float worstSat = 1.0f;   // worst ratio among SATURATED wheels (limits the group)
   float bestAll  = 0.0f;   // best ratio among ALL commanded wheels (the achievable)
   bool  anySat   = false;
+  int   nCmd = 0, nWrong = 0;   // commanded wheels / of those, turning against it
   for (int i = 0; i < 4; i++) {
     if (valid && !valid[i]) continue;                 // no usable feedback
     float tgt  = ((float)cmd[i] / 1000.0f) * refTps;
@@ -84,7 +102,8 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
     // A wheel physically turning OPPOSITE its command is not tracking at all.
     bool wrongWay = (tgt > 0.0f && measTps[i] < 0.0f) ||
                     (tgt < 0.0f && measTps[i] > 0.0f);
-    if (wrongWay) ratio = 0.0f;
+    nCmd++;
+    if (wrongWay) { ratio = 0.0f; nWrong++; }
 
     // Every commanded wheel contributes to "what is achievable right now" — a
     // wheel with PWM headroom that is tracking well sets the reference the laggards
@@ -100,6 +119,7 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
     if (ratio < worstSat) worstSat = ratio;
   }
 
+  if (nCmd > 0 && nWrong == nCmd) return 1.0f;        // braking through a reversal
   if (!anySat) return 1.0f;                           // nothing maxed-out -> no drag
   if (bestAll < 0.05f) return loScale;                // everything failing -> floor
   // Group-relative: slow to the laggard's share of the best-tracking wheel. Uniform
@@ -112,16 +132,12 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
 
 // Fade the governor's throttle DEPTH by how rotational the commanded twist is.
 //
-// WHY: speedGovernorScale judges each wheel against the UNIFORM no-load refTps
-// (= maxTpsMin, calibrated wheels-off-ground). Spin-in-place forces the mecanum
-// rollers to scrub SIDEWAYS across the floor — the highest-load move — so every
-// wheel saturates yet falls well below that no-load target. The governor reads
-// this as ALL FOUR wheels failing and throttles the spin toward GOV_FLOOR (crawl /
-// surge-and-stall). But symmetric scrub load is exactly NOT the held-corner case
-// the governor exists to catch: when every wheel is slow together there is nothing
-// to cross-correct. Forward/strafe never trip it (free-rolling wheels reach the
-// no-load speed), only rotation does. (Independent of supply voltage — adding a
-// battery cannot make a sideways-scrubbing roller reach its free-air rate.)
+// WHY: spin-in-place forces the mecanum rollers to scrub SIDEWAYS across the
+// floor — the highest-load move. When the governor judged wheels against the
+// absolute no-load reference, every wheel read as failing and the spin was
+// throttled toward GOV_FLOOR. Since BUG-001 the judge is group-relative
+// (symmetric scrub -> worst == best -> no throttle), so this relax is now a
+// secondary backstop for ASYMMETRIC scrub during rotation, not the primary cure.
 //
 // FIX: scale how much of the throttle survives by the TRANSLATION fraction of the
 // commanded twist. Pure spin (omega dominates) -> throttle relaxed back to 1.0

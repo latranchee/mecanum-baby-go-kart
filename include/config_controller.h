@@ -11,14 +11,31 @@ static const uint8_t  SPEED_STEP   = 10;     // speed % increment per button pre
 static const uint32_t SEND_INTERVAL_MS = 20; // ~50Hz send rate
 
 // Stick centre calibration (controller_logic.h stickCalAdd). CAL_SAMPLES readings
-// (one per send tick, ~320 ms) must average within CENTER_TOL raw counts of
-// mid-scale and move less than CENTER_SPREAD, or the set is rejected and retried.
-// Full deflection is ~HALF_RANGE (2000) counts from centre, so a stick held even
-// halfway at power-on is refused. A healthy stick rests within a few dozen counts.
-static const uint16_t CENTER_NOMINAL = 2048;
-static const uint16_t CENTER_TOL     = 400;
+// (one per send tick, ~320 ms) must average within CENTER_TOL raw counts of THIS
+// UNIT's rest position CENTER_REST[] and move less than CENTER_SPREAD, or the set
+// is rejected and retried.
+//
+// CENTER_REST = this Atom JoyStick's sticks at rest, axis order L horiz, L vert,
+// R horiz, R vert. Measured 2026-10-05 over three power-ups: L horiz 1929-1966,
+// L vert 1912-1927, R horiz 1976-2015, R vert 1994-2025 (midpoints below; the
+// rest wanders up to +-20 between power-ups). A different joystick unit needs its
+// own values: read the "calibration rejected ... L=(h,v) R=(h,v)" lines on the
+// controller's serial log with the sticks released.
+//
+// The no-creep guarantee: an accepted centre is within CENTER_TOL of CENTER_REST,
+// and the true rest is within CENTER_DRIFT of it, so the released stick reads at
+// most CENTER_TOL + CENTER_DRIFT from the centre, which must stay inside the
+// deadzone (static_assert below). A stick held lightly at power-on is either
+// refused (beyond CENTER_TOL) or too close to rest to move the cart once released.
+// If the sticks wander further than CENTER_DRIFT over time, calibration refuses
+// with the sticks released (status stays CENTER): re-measure CENTER_REST.
+static const uint16_t CENTER_REST[4] = { 1948, 1920, 1996, 2010 };
+static const uint16_t CENTER_TOL     = 45;
+static const uint16_t CENTER_DRIFT   = 25;
 static const uint16_t CENTER_SPREAD  = 60;
 static const uint8_t  CAL_SAMPLES    = 16;
+static_assert(CENTER_TOL + CENTER_DRIFT < DEADZONE_RAW,
+              "an accepted stick centre must stay inside the deadzone of the true rest");
 
 // Joystick bus (I2C) health. After JOY_FAIL_TRIP consecutive failed reads (~100 ms)
 // the controller shows JOY ERR, disarms and sends e-stop frames (faster than the
@@ -27,8 +44,12 @@ static const uint8_t  CAL_SAMPLES    = 16;
 static const uint16_t JOY_FAIL_TRIP  = 5;
 static const uint32_t JOY_REINIT_MS  = 500;
 
-// Axis inversion toggles. Flip per-axis if joystick orientation is reversed
-// relative to robot frame (e.g. controller mounted backwards).
+// Axis inversion toggles. INVERT_VX + INVERT_VY together = a 180-degree turn: the
+// RIDER faces the FIRMWARE's rear. Confirmed on the bench 2026-10-05: motor slot 0
+// (firmware "FL") is the rider's REAR-RIGHT wheel. So rider forward = firmware
+// -vx and rider strafe-right = firmware -vy; rotation is unaffected by a 180-degree
+// turn (INVERT_OMEGA stays false). Firmware-frame names (FL/FR/RL/RR) map to the
+// rider's RR/RL/FR/FL; the robot prints both (src/robot/main.cpp RIDER_NAME).
 static const bool INVERT_VX    = true;   // front <-> back
 static const bool INVERT_VY    = true;   // strafe left <-> right
 static const bool INVERT_OMEGA = false;  // CW <-> CCW
@@ -40,7 +61,7 @@ static const CurveCfg CURVE = { 3, 1.0f, 0.05f, 6.0f, 0.59f, 2.0f };  // logisti
 // ~60x — applied to omega it makes a "slight turn" produce near-zero commanded
 // yaw, so curving and spinning are not a smooth function of stick (the operator's
 // small turn does nothing, then the cart snaps). omega gets its own gentler curve:
-// a mild power (p=1.4) with NO curve-side deadzone (normalize() already deadbands
+// a mild power (p=1.3) with NO curve-side deadzone (normalize() already deadbands
 // the raw stick, so the logistic's extra 0.05 deadzone was a redundant second dead
 // region on the turn axis). vx/vy keep CURVE so working forward/strafe feel is
 // unchanged.
