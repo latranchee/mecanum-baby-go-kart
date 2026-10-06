@@ -113,7 +113,7 @@ Requires [PlatformIO](https://platformio.org/) (`pio`).
 
 ```sh
 pio run -e robot                    # build robot
-pio run -e robot -t upload          # flash robot       (upload_port COM8)
+pio run -e robot -t upload          # flash robot       (upload_port COM5)
 pio run -e controller -t upload     # flash controller  (upload_port COM6)
 pio run -e headset -t upload        # flash headset      (upload_port COM7)
 pio device monitor -e robot         # serial @ 115200
@@ -172,7 +172,7 @@ governor and body correction).
 ## tools/
 
 Python helpers (need `pyserial`: `pip install pyserial`). Each takes the robot's
-COM port as `--port COMx` (default COM8).
+COM port as `--port COMx` (default COM5).
 
 | Tool | Purpose |
 |------|---------|

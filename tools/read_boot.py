@@ -9,7 +9,7 @@ import serial
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', default='COM8')
+    p.add_argument('--port', default='COM5')
     p.add_argument('--baud', type=int, default=115200)
     p.add_argument('--secs', type=float, default=5.0)
     args = p.parse_args()
