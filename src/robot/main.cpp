@@ -1118,10 +1118,11 @@ void loop() {
         for (int i = 0; i < 4; i++) valid[i] = !openLoop[i] && !(faultMask & (1u << i));
         // Judge wheels by magnitude + output saturation (sign-independent), so a
         // held wheel is caught identically in forward and reverse. Uses last tick's
-        // measured speeds and PWM.
+        // measured speeds and PWM, against the targets govScale actually asked for.
         float gTarget = speedGovernorScale(curCmd, lastMeasTps, lastOutPwm,
                                            cmdRefTps(), (float)PWM_MAX,
-                                           GOV_FLOOR, GOV_SAT_FRAC, valid);  // uniform ref
+                                           GOV_FLOOR, GOV_PIN_FRAC, valid,   // uniform ref
+                                           govScale, GOV_TOL, GOV_PROBE_UP * dt);
         // Spin-in-place scrubs all wheels equally below the no-load refTps, which the
         // governor would read as universal failure and throttle to a crawl. Symmetric
         // load is not the held-corner case it exists for, so fade the throttle by how
@@ -1179,7 +1180,7 @@ void loop() {
 
         BodyLoopCfg bc = { BODY_KP_TRANS, BODY_KP_W, BODY_KI_TRANS, BODY_KI_W,
                            BODY_I_MAX, BODY_W_THRESH, BODY_RATE, BODY_CORR_MAX,
-                           BODY_YAW_FWD_FRAC, BODY_I_DECAY };
+                           BODY_YAW_FWD_FRAC, BODY_I_DECAY, BODY_STRAIGHT_W };
         // Reference = the twist the slewed base expresses (bVx..), NOT the packet.
         // With the packet, any forward+turn past 1000 left a standing error the
         // wheels could never close (the mix had scaled the command down): the loop

@@ -31,7 +31,7 @@
 // it never drags. When a lagging wheel speeds up its PWM falls below saturation and
 // the group scale climbs back to 1.0 — self-recovering, no latch.
 //
-//   cmd[i]    : slewed wheel command, -1000..+1000 (the units pidStep consumes)
+//   cmd[i]    : slewed wheel command BEFORE this scale, -1000..+1000 (pidStep units)
 //   measTps[] : last measured ticks/sec per wheel (signed, encSign-corrected)
 //   outPwm[]  : last commanded PWM per wheel (signed, |.| <= pwmMax)
 //   refTps    : UNIFORM target reference — cmd magnitude 1000 == refTps for every
@@ -73,23 +73,42 @@
 // A SINGLE wrong-way wheel among tracking ones is still a dragged/held corner and
 // still floors the group.
 //
-// KNOWN LIMIT (audit 2026-10-05, simulated, not fixed): ratios are judged against
-// the UN-throttled command, so an unsaturated wheel tracking its throttled target
-// reads ratio = current scale. With one wheel pinned at its ceiling the scale
-// therefore settles near sqrt(laggard ratio) instead of the ratio, leaving a
-// residual mismatch (and yaw) when a weak pair runs out of PWM. The two simple
-// alternatives tried (count headroom as 1.0; judge against governed targets)
-// both ratchet speed down under heavy load. Needs a redesign + floor test.
+// GOVERNED-TARGET JUDGE (strafe yaw fix 2026-10-05). Ratios used to be judged
+// against the UN-throttled command, so a wheel tracking its THROTTLED target read
+// ratio = current scale and the best wheel's ratio fell with the scale. With one
+// pair pinned at its ceiling the scale settled at sqrt(laggard ratio), not the
+// ratio: the strong pair kept running ahead of the weak one. In a strafe that gap
+// between the front and rear pairs IS yaw (mecanumMix's omega column); in forward
+// drive the same gap only lands on the null axis, which is why strafing was the
+// move that swung the nose round. The rider's rear pair runs on the weaker pack
+// (config_robot.h MAX_TPS) and carries the rider, so it is the pair that pins.
+// Every ratio is now judged against the target the wheel was actually asked for
+// (cmd x curScale), and a lagging pinned wheel moves the group to its real pace in
+// one step: curScale x (worst/best) / (1 - tol), which parks it just inside the
+// tolerance instead of exactly at its ceiling. Two rules keep that from ratcheting
+// speed down under heavy load (what sank the earlier attempt at this judge):
+//   - a pinned wheel within `tol` of the best wheel is keeping up and does not
+//     drag (encoder noise alone cannot walk the scale down);
+//   - a pinned wheel that keeps up lets the scale creep back up by `probeStep`
+//     per call, so the group re-finds the laggard's ceiling when load eases. With
+//     no pinned wheel the scale releases to 1.0 as before.
+// Steady state: the laggard runs at its ceiling and the others within `tol` of it.
 //
 // Pure integer/float math, no Arduino deps — host-testable.
+//   curScale  : the scale applied to the commands this measurement came from.
+//   tol       : lag (fraction of the best wheel's tracking) a pinned wheel may
+//               show before it drags the group. Keep above encoder noise.
+//   probeStep : scale increase per call while a pinned wheel keeps up.
 static inline float speedGovernorScale(const int32_t cmd[4], const float measTps[4],
                                         const float outPwm[4], float refTps, float pwmMax,
                                         float loScale, float satFrac,
-                                        const bool valid[4]) {
+                                        const bool valid[4],
+                                        float curScale, float tol, float probeStep) {
   float worstSat = 1.0f;   // worst ratio among SATURATED wheels (limits the group)
   float bestAll  = 0.0f;   // best ratio among ALL commanded wheels (the achievable)
   bool  anySat   = false;
   int   nCmd = 0, nWrong = 0;   // commanded wheels / of those, turning against it
+  const float asked = curScale > 0.01f ? curScale : 0.01f;   // GOV_FLOOR 0 is legal
   for (int i = 0; i < 4; i++) {
     if (valid && !valid[i]) continue;                 // no usable feedback
     float tgt  = ((float)cmd[i] / 1000.0f) * refTps;
@@ -97,7 +116,7 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
     if (atgt < 0.05f * refTps) continue;              // ~zero demand: ignore
 
     float ameas = measTps[i] < 0 ? -measTps[i] : measTps[i];
-    float ratio = ameas / atgt;                       // MAGNITUDE: sign-independent
+    float ratio = ameas / (atgt * asked);             // MAGNITUDE, vs the governed target
     if (ratio > 1.0f) ratio = 1.0f;
     // A wheel physically turning OPPOSITE its command is not tracking at all.
     bool wrongWay = (tgt > 0.0f && measTps[i] < 0.0f) ||
@@ -123,8 +142,11 @@ static inline float speedGovernorScale(const int32_t cmd[4], const float measTps
   if (!anySat) return 1.0f;                           // nothing maxed-out -> no drag
   if (bestAll < 0.05f) return loScale;                // everything failing -> floor
   // Group-relative: slow to the laggard's share of the best-tracking wheel. Uniform
-  // load -> worstSat==bestAll -> 1.0; a lagging corner -> worstSat/bestAll < 1.
-  float scale = worstSat / bestAll;
+  // load -> worstSat==bestAll -> no drag; a lagging corner -> worstSat/bestAll < 1.
+  float lag = worstSat / bestAll;
+  float keep = 1.0f - tol;                             // tolerated lag
+  float scale = lag < keep ? curScale * lag / keep     // slow the group to its pace
+                           : curScale + probeStep;     // keeping up: creep back up
   if (scale > 1.0f) scale = 1.0f;
   if (scale < loScale) scale = loScale;
   return scale;

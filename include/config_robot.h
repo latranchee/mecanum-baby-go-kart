@@ -82,8 +82,10 @@ static const float PWM_SLEW = 2500.0f;  // full 0..1023 in ~410ms
 // supply-limited) and the cart stays pointed straight.
 //   GOV_FLOOR  : lowest group scale. 0.0 => a held wheel halts the cart; 0.10
 //                leaves a crawl. Set 1.0 (or SYNC_GOVERNOR 0) to disable.
-//   GOV_SAT_FRAC: |out| >= this fraction of PWM_MAX marks a wheel saturated. ONLY
-//                saturated wheels can drag the group (an unsaturated wheel has
+//   GOV_SAT_FRAC: |out| >= this fraction of PWM_MAX marks a wheel near saturation:
+//                the body loop's freeze gate (src/robot/main.cpp anySat).
+//   GOV_PIN_FRAC: |out| >= this fraction marks a wheel PINNED, giving all it can.
+//                ONLY pinned wheels can drag the group (an unpinned wheel has
 //                headroom or is merely throttled) — this is the engage gate and
 //                the fix for the old latch where forward drive stuck at the floor.
 //   GOV_SLEW   : how fast the applied scale may move (1/sec), low-passed so a
@@ -103,7 +105,13 @@ static const float PWM_SLEW = 2500.0f;  // full 0..1023 in ~410ms
 #define CLOSED_LOOP_DEFAULT 1
 #endif
 static const float GOV_FLOOR    = 0.10f;
-static const float GOV_SAT_FRAC = 0.85f;  // |out| >= 85% PWM_MAX = wheel maxed out
+static const float GOV_SAT_FRAC = 0.85f;  // |out| >= 85% PWM_MAX = near max (body-loop freeze)
+// The governor's drag gate used to be GOV_SAT_FRAC too. With the governed-target
+// judge (below) that over-throttled a loaded strafe by ~30% in simulation: the rear
+// pair idles at 85-90% PWM while its PI is still winding up, so it read as "can't
+// keep up" with 10-15% of its PWM unused. A held wheel still reaches the rail in a
+// few ticks (PWM_SLEW), so block-catching only waits ~50 ms longer.
+static const float GOV_PIN_FRAC = 0.97f;  // |out| >= 97% PWM_MAX = pinned (governor drag)
 // Asymmetric slew: drop FAST so a sudden block/stall is caught in a few ticks,
 // recover SLOWLY so drive eases back smoothly without a lurch. (BUG-008) The old
 // 12-vs-3 ratio (4x) let govScale RATCHET toward the floor under a train of brief
@@ -113,6 +121,15 @@ static const float GOV_SAT_FRAC = 0.85f;  // |out| >= 85% PWM_MAX = wheel maxed 
 // between micro-saturations so a loaded forward+turn does not pin to a crawl.
 static const float GOV_SLEW_DOWN = 12.0f;  // full 1->0 in ~85 ms (catch blocks)
 static const float GOV_SLEW_UP   = 6.0f;   // full 0->1 in ~165 ms (recover, no ratchet)
+// Governed-target judge (governor.h, strafe yaw fix 2026-10-05). GOV_TOL = how far
+// a pinned wheel may trail the best-tracking wheel: the governor parks it there,
+// so it is the front/rear mismatch left in a saturated strafe (before heading hold
+// trims it). Simulated with encoder noise up to 600 tps: no speed ratchet over 12 s.
+// GOV_PROBE_UP = how fast the scale creeps back up while a pinned wheel keeps up,
+// so the group re-finds the laggard's ceiling as load eases (1/s). 0.08 / 1.0
+// both worked; these two gave the smoothest scale (+-4%) in the loaded strafe.
+static const float GOV_TOL      = 0.05f;
+static const float GOV_PROBE_UP = 0.3f;
 // Rotation relax (governor.h governorRotationRelax): spin-in-place scrubs all four
 // rollers sideways below the no-load refTps, so the governor reads universal
 // saturation and throttles the spin to a crawl — yet symmetric load is NOT the
@@ -158,9 +175,15 @@ static const float GOV_SPIN_RELAX_TRANS_W = 0.5f;
 #endif
 static const float BODY_IIR_ALPHA_TRANS = 0.50f;  // vx estimate (lighter filter)
 static const float BODY_IIR_ALPHA_W     = 0.30f;  // omega/vy estimate (heavier)
-static const float BODY_KP_W      = 0.28f;
+// Yaw gains raised 2026-10-05 (were 0.28 / 0.15) for the strafe yaw fix: the weak
+// rear pack lags the front pair while both PI loops wind up after a start, and in a
+// strafe that lag is yaw. In simulation 0.45 / 0.5 cut the heading error of a 2 s
+// loaded strafe by another 25-40% with no added oscillation in strafe, curve, spin
+// or noisy-encoder runs; 0.6 / 0.8 bought almost nothing more. Floor-check: if the
+// nose hunts left-right on a straight move, step back toward 0.28 / 0.15.
+static const float BODY_KP_W      = 0.45f;
 static const float BODY_KP_TRANS  = 0.15f;
-static const float BODY_KI_W      = 0.15f;        // /s, clamped
+static const float BODY_KI_W      = 0.50f;        // /s, clamped
 static const float BODY_KI_TRANS  = 0.10f;        // /s, clamped
 static const float BODY_I_MAX     = 150.0f;       // ~15% of 1000 cmd authority
 static const float BODY_CORR_MAX  = 200.0f;       // hard per-axis correction clamp
@@ -188,6 +211,11 @@ static const float BODY_W_THRESH  = 500.0f;       // |omega_cmd| => fully "rotat
 static const float BODY_RATE      = 400.0f;       // correction slew, cmd units/sec
 static const float BODY_GOV_FREEZE = 0.95f;       // govScale below this freezes integral
 static const float BODY_SLIP_GATE  = 250.0f;      // |s| (cmd units) above this freezes integral
+// |omega_cmd| below which yaw hold stays on through a freeze (body_loop.h): with no
+// turn asked the yaw reference is zero, so holding it can only straighten the cart.
+// A loaded strafe sits at the saturation gate the whole way and used to lose heading
+// hold there (2026-10-05 floor report). Fully off by this much turn (10% of axis).
+static const float BODY_STRAIGHT_W = 100.0f;
 
 // Stall detection (telemetry only): flag a wheel pinned near max PWM while barely
 // moving (held/jammed/supply-collapsed) so the operator can see WHICH wheel.
